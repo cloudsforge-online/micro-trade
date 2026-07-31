@@ -1,0 +1,51 @@
+{
+  "name": "@cloudsforge/trade",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Forge Trade — backtesting, paper and live trading bots. Carries the Crucible engine forward intact and fixes the concurrency defects around it: one settlement per period at the schema level, post-trade state written with the fill, leased jobs instead of timers, backtests off the request path, and capital held as a real ledger reservation.",
+  "license": "MIT",
+  "type": "module",
+  "packageManager": "pnpm@11.9.0",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "start": "node --import tsx src/index.ts",
+    "migrate": "node --import tsx src/migrator.ts",
+    "typecheck": "tsc --noEmit",
+    "_test": "--test-concurrency=1 is required, not a preference: every database test file truncates between cases, and node:test runs FILES in parallel by default. A TRUNCATE takes an AccessExclusiveLock, so one file's reset deadlocks against another file's inserts (40P01). The ledger and billing both learned this the hard way.",
+    "test": "node --import tsx --test --test-concurrency=1 src/*.test.ts",
+    "build": "tsc -p tsconfig.build.json",
+    "check": "pnpm typecheck && pnpm test"
+  },
+  "_localDependencies": [
+    "The @cloudsforge/* packages are consumed from sibling checkouts because none of them is",
+    "published yet. Once AD-02 lands they all become registry versions ('^1.0.0') and these paths —",
+    "plus the two build contexts in the Dockerfile — are deleted. Nothing else changes.",
+    "",
+    "The runtime packages take 'file:' and the contracts packages take 'link:'. The difference is",
+    "not cosmetic: @cloudsforge/contracts-money depends on @cloudsforge/contracts-chain with the",
+    "'workspace:^' protocol, which only resolves inside the contracts workspace. 'file:' would make",
+    "pnpm try to resolve that transitive itself and fail; 'link:' symlinks the package in place and",
+    "lets it keep using its own already-installed node_modules.",
+    "",
+    "tsx is a runtime dependency for the same reason: the unpublished packages resolve to their",
+    "TypeScript sources."
+  ],
+  "dependencies": {
+    "@cloudsforge/auth": "file:../runtime/packages/auth",
+    "@cloudsforge/contracts-auth": "link:../contracts/packages/auth",
+    "@cloudsforge/contracts-chain": "link:../contracts/packages/chain",
+    "@cloudsforge/contracts-money": "link:../contracts/packages/money",
+    "@cloudsforge/db": "file:../runtime/packages/db",
+    "@cloudsforge/http": "file:../runtime/packages/http",
+    "@cloudsforge/jobs": "file:../runtime/packages/jobs",
+    "@cloudsforge/lifecycle": "file:../runtime/packages/lifecycle",
+    "@cloudsforge/telemetry": "file:../runtime/packages/telemetry",
+    "postgres": "^3.4.5",
+    "tsx": "^4.19.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "jose": "^5.9.6",
+    "typescript": "^5.7.2"
+  }
+}

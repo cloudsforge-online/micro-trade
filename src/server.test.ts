@@ -1,0 +1,605 @@
+/**
+ * The HTTP surface, over a real socket against a real Postgres.
+ *
+ * Two things are under test here that are not under test anywhere else: **the auth-fault mapping**
+ * (a bad token is 401, an unreachable verifier is 503, and confusing them signs the estate out), and
+ * **idempotency on every mutating route** — which is not a nice-to-have here, because `start`
+ * reserves capital and a retried start without a key would be a second reservation.
+ */
+
+import assert from 'node:assert/strict'
+import test, { after, before, beforeEach } from 'node:test'
+import type { Server } from 'node:http'
+import type { AddressInfo } from 'node:net'
+import type postgres from 'postgres'
+import { Lifecycle } from '@cloudsforge/lifecycle'
+import { Logger, Metrics, registerHttpMetrics, registerJobMetrics } from '@cloudsforge/telemetry'
+import { createServer, registerServiceMetrics } from './server.ts'
+import { signEvent } from './outbox.ts'
+import { runBacktest } from './backtests.ts'
+import { RATE_SCALE } from './money.ts'
+import {
+  ALICE,
+  BOB,
+  EVENT_SECRET,
+  enabled,
+  fakeLedger,
+  fakePricing,
+  freshKey,
+  makeBars,
+  migrateTestDb,
+  openDb,
+  quietLogger,
+  resetTrade,
+  seedSeries,
+  skip,
+  testClock,
+  verifier,
+  type FakeLedger,
+  type FakePricing,
+  type TestClock,
+} from './testsupport.ts'
+import type { Db } from './outbox.ts'
+
+let sql: postgres.Sql
+let db: Db
+let server: Server
+let baseUrl: string
+let ledger: FakeLedger
+let pricing: FakePricing
+let clock: TestClock
+let enqueued: Array<{ kind: string; key: string }>
+let seriesId: string
+
+const BAR_WIDTH = 3_600
+const BARS = makeBars({ count: 200, shape: 'sawtooth', widthSeconds: BAR_WIDTH })
+const NEWEST = BARS[BARS.length - 1] as (typeof BARS)[number]
+const FRESH_MS = (NEWEST.t + BAR_WIDTH + 1) * 1000
+
+before(async () => {
+  if (!enabled) return
+  sql = openDb()
+  db = sql as unknown as Db
+  await migrateTestDb(sql)
+
+  const lifecycle = new Lifecycle({ drainDelayMs: 0, drainTimeoutMs: 1_000 })
+  const metrics = registerServiceMetrics(registerJobMetrics(registerHttpMetrics(new Metrics())))
+  ledger = fakeLedger()
+  pricing = fakePricing()
+  clock = testClock(FRESH_MS)
+  enqueued = []
+
+  server = createServer({
+    lifecycle,
+    // Discarded unless DEBUG_TRADE is set, which is how the 500 behind a failing assertion is read.
+    logger: process.env['DEBUG_TRADE']
+      ? new Logger({ service: 'trade-test', level: 'debug' })
+      : new Logger({ service: 'trade-test', level: 'fatal', sink: () => {} }),
+    metrics,
+    verifier,
+    sql: db,
+    producer: 'trade',
+    queue: {
+      async enqueue(options: { kind: string; key: string }) {
+        enqueued.push({ kind: options.kind, key: options.key })
+      },
+    },
+    // Read through getters so `beforeEach` can replace the fakes without rebuilding the server.
+    get ledger() {
+      return ledger
+    },
+    get pricing() {
+      return pricing
+    },
+    get clock() {
+      return clock
+    },
+    liveEnabled: true,
+    settlementPeriodSeconds: 3_600,
+    eventSigningSecret: EVENT_SECRET,
+  } as never)
+
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()))
+  baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`
+  lifecycle.markReady()
+})
+
+beforeEach(async () => {
+  if (!enabled) return
+  await resetTrade(sql)
+  ledger = fakeLedger()
+  ledger.setBalance(ALICE, 100_000_000n)
+  pricing = fakePricing()
+  pricing.set('BTC', 30_000n * RATE_SCALE)
+  clock = testClock(FRESH_MS)
+  enqueued = []
+  seriesId = await seedSeries(db, BARS)
+})
+
+after(async () => {
+  if (!enabled) return
+  await new Promise<void>((resolve) => server.close(() => resolve()))
+  await sql.end({ timeout: 5 })
+})
+
+interface CallOptions {
+  method?: string
+  token?: string
+  body?: unknown
+  headers?: Record<string, string>
+  key?: string | null
+}
+
+async function call(path: string, options: CallOptions = {}): Promise<{ status: number; body: any; headers: Headers }> {
+  const response = await fetch(`${baseUrl}${path}`, {
+    method: options.method ?? 'GET',
+    headers: {
+      'content-type': 'application/json',
+      ...(options.token ? { authorization: `Bearer ${options.token}` } : {}),
+      ...(options.key === null ? {} : { 'idempotency-key': options.key ?? freshKey() }),
+      ...(options.headers ?? {}),
+    },
+    ...(options.body === undefined ? {} : { body: JSON.stringify(options.body) }),
+  })
+  const text = await response.text()
+  // `/metrics` answers Prometheus text, not JSON, so the helper must not assume a body it can parse.
+  const isJson = (response.headers.get('content-type') ?? '').includes('json')
+  return {
+    status: response.status,
+    body: text.length > 0 && isJson ? JSON.parse(text) : text,
+    headers: response.headers,
+  }
+}
+
+const botBody = (overrides: Record<string, unknown> = {}) => ({
+  name: 'my bot',
+  mode: 'paper',
+  seriesId,
+  strategyId: 'sma_cross',
+  params: { fast: 5, slow: 20 },
+  allocation: '1000000',
+  ...overrides,
+})
+
+async function createBot(overrides: Record<string, unknown> = {}, token = 'alice'): Promise<string> {
+  const response = await call('/v1/bots', { method: 'POST', token, body: botBody(overrides) })
+  assert.equal(response.status, 201, JSON.stringify(response.body))
+  return response.body.botId as string
+}
+
+/* ------------------------------------------------------------------ health */
+
+test('livez is static, so a database blip does not restart a healthy process', { skip }, async () => {
+  const response = await call('/livez')
+  assert.equal(response.status, 200)
+  assert.equal(response.body.ok, true)
+})
+
+test('readyz reports the probe set, and metrics render in Prometheus text', { skip }, async () => {
+  const ready = await call('/readyz')
+  assert.ok(ready.status === 200 || ready.status === 503)
+  assert.ok(Array.isArray(ready.body.checks))
+
+  const metrics = await call('/metrics')
+  assert.equal(metrics.status, 200)
+  assert.match(metrics.headers.get('content-type') ?? '', /text\/plain/)
+  assert.match(String(metrics.body), /http_requests_total/)
+})
+
+test('every response carries the request id in the body and the header', { skip }, async () => {
+  const response = await call('/v1/bots', { token: 'nope' })
+  assert.equal(response.status, 401)
+  assert.equal(response.body.error.requestId, response.headers.get('x-request-id'))
+})
+
+test('an inbound request id is echoed only when it is safe to log', { skip }, async () => {
+  const safe = await call('/livez', { headers: { 'x-request-id': 'abc-123_XYZ' } })
+  assert.equal(safe.headers.get('x-request-id'), 'abc-123_XYZ')
+  const unsafe = await call('/livez', { headers: { 'x-request-id': 'a b<script>' } })
+  assert.notEqual(unsafe.headers.get('x-request-id'), 'a b<script>')
+})
+
+test('an unmatched path is a 404 with the standard error shape', { skip }, async () => {
+  const response = await call('/v1/nothing')
+  assert.equal(response.status, 404)
+  assert.equal(response.body.error.code, 'not_found')
+})
+
+/* ------------------------------------------------------------------ auth */
+
+test('a bad token is 401 and never says which half of it was wrong', { skip }, async () => {
+  const response = await call('/v1/bots', { token: 'forged' })
+  assert.equal(response.status, 401)
+  assert.equal(response.body.error.message, 'a valid bearer token is required')
+})
+
+test('a missing token takes the same 401 path as a bad one', { skip }, async () => {
+  assert.equal((await call('/v1/bots')).status, 401)
+})
+
+test('an unreachable verifier is 503, not 401, or one identity blip signs the estate out', { skip }, async () => {
+  const response = await call('/v1/bots', { token: 'down' })
+  assert.equal(response.status, 503)
+  assert.equal(response.body.error.code, 'verifier_unavailable')
+})
+
+test('a service token without the scope is 403 and names what it lacked', { skip }, async () => {
+  const response = await call('/v1/bots', { token: 'svc-none' })
+  assert.equal(response.status, 403)
+  assert.match(response.body.error.message, /trade:read/)
+})
+
+test('a user cannot read another user bot', { skip }, async () => {
+  const botId = await createBot()
+  const response = await call(`/v1/bots/${botId}`, { token: 'bob' })
+  assert.equal(response.status, 404, 'a bot belonging to someone else must not be readable')
+})
+
+test('an admin may read another user bot, because operators exist', { skip }, async () => {
+  const botId = await createBot()
+  const response = await call(`/v1/bots/${botId}?userId=${ALICE}`, { token: 'admin' })
+  assert.equal(response.status, 200)
+})
+
+test('the strategy catalogue is public, because it is a product surface', { skip }, async () => {
+  const response = await call('/v1/strategies')
+  assert.equal(response.status, 200)
+  assert.equal(response.body.strategies.length, 10)
+  assert.ok(response.body.strategies.every((s: { weakness: string }) => s.weakness.length > 0))
+})
+
+test('only an operator may register a series or ingest bars', { skip }, async () => {
+  const asUser = await call('/v1/series', {
+    method: 'POST',
+    token: 'alice',
+    body: { symbol: 'ETH-USD', assetCode: 'ETH', timeframe: '1h', source: 'x' },
+  })
+  assert.equal(asUser.status, 403)
+
+  const asOperator = await call('/v1/series', {
+    method: 'POST',
+    token: 'admin',
+    body: { symbol: 'ETH-USD', assetCode: 'ETH', timeframe: '1h', source: 'x' },
+  })
+  assert.equal(asOperator.status, 201)
+})
+
+/* ------------------------------------------------------------------ idempotency */
+
+test('a mutating request without an idempotency key is refused', { skip }, async () => {
+  const response = await call('/v1/bots', { method: 'POST', token: 'alice', body: botBody(), key: null })
+  assert.equal(response.status, 400)
+  assert.match(response.body.error.message, /idempotency-key/)
+})
+
+test('the same key with the same body replays rather than creating a second bot', { skip }, async () => {
+  const key = freshKey()
+  const first = await call('/v1/bots', { method: 'POST', token: 'alice', body: botBody(), key })
+  const second = await call('/v1/bots', { method: 'POST', token: 'alice', body: botBody(), key })
+  assert.equal(first.status, 201)
+  assert.equal(second.status, 200, 'a replay must be distinguishable from a fresh create')
+  assert.equal(first.body.botId, second.body.botId)
+
+  const list = await call('/v1/bots', { token: 'alice' })
+  assert.equal(list.body.bots.length, 1)
+})
+
+test('the same key with a different body is refused rather than replayed', { skip }, async () => {
+  // Returning the first request's answer to a second, different request is worse than an error: the
+  // caller believes the thing it asked for happened.
+  const key = freshKey()
+  await call('/v1/bots', { method: 'POST', token: 'alice', body: botBody(), key })
+  const second = await call('/v1/bots', {
+    method: 'POST',
+    token: 'alice',
+    body: botBody({ allocation: '9999999' }),
+    key,
+  })
+  assert.equal(second.status, 409)
+  assert.equal(second.body.error.code, 'idempotency_key_reuse')
+})
+
+test('a retried start reserves capital once, not twice', { skip }, async () => {
+  const botId = await createBot({ mode: 'live' })
+  const key = freshKey()
+  await call(`/v1/bots/${botId}/actions`, { method: 'POST', token: 'alice', body: { action: 'start' }, key })
+  await call(`/v1/bots/${botId}/actions`, { method: 'POST', token: 'alice', body: { action: 'start' }, key })
+  assert.equal(ledger.keys.filter((k) => k.startsWith('trade:allocation:')).length, 1)
+})
+
+/* ------------------------------------------------------------------ bots */
+
+test('a bot is created, listed and read back with its amounts as decimal strings', { skip }, async () => {
+  const botId = await createBot()
+  const response = await call(`/v1/bots/${botId}`, { token: 'alice' })
+  assert.equal(response.status, 200)
+  assert.equal(typeof response.body.bot.allocation, 'string')
+  assert.equal(response.body.bot.allocation, '1000000')
+  assert.equal(response.body.bot.status, 'draft')
+})
+
+test('an allocation sent as an unsafe JSON number is refused rather than silently truncated', { skip }, async () => {
+  const response = await call('/v1/bots', {
+    method: 'POST',
+    token: 'alice',
+    body: botBody({ allocation: Number.MAX_SAFE_INTEGER + 2 }),
+  })
+  assert.equal(response.status, 400)
+  assert.match(response.body.error.message, /decimal string/)
+})
+
+test('an unknown strategy or series is a 404, not a 500', { skip }, async () => {
+  assert.equal((await call('/v1/bots', { method: 'POST', token: 'alice', body: botBody({ strategyId: 'nope' }) })).status, 404)
+  assert.equal(
+    (
+      await call('/v1/bots', {
+        method: 'POST',
+        token: 'alice',
+        body: botBody({ seriesId: '00000000-0000-4000-8000-000000000000' }),
+      })
+    ).status,
+    404,
+  )
+})
+
+test('a bot moves through start, pause and stop', { skip }, async () => {
+  const botId = await createBot()
+  const started = await call(`/v1/bots/${botId}/actions`, { method: 'POST', token: 'alice', body: { action: 'start' } })
+  assert.equal(started.status, 200)
+  assert.equal(started.body.status, 'running')
+
+  const paused = await call(`/v1/bots/${botId}/actions`, { method: 'POST', token: 'alice', body: { action: 'pause' } })
+  assert.equal(paused.body.status, 'paused')
+
+  const stopped = await call(`/v1/bots/${botId}/actions`, { method: 'POST', token: 'alice', body: { action: 'stop' } })
+  assert.equal(stopped.body.status, 'stopped')
+})
+
+test('an unknown action is a 400 rather than a silent no-op', { skip }, async () => {
+  const botId = await createBot()
+  const response = await call(`/v1/bots/${botId}/actions`, {
+    method: 'POST',
+    token: 'alice',
+    body: { action: 'explode' },
+  })
+  assert.equal(response.status, 400)
+})
+
+test('pausing a bot that is not running is a 409 that says so', { skip }, async () => {
+  const botId = await createBot()
+  const response = await call(`/v1/bots/${botId}/actions`, { method: 'POST', token: 'alice', body: { action: 'pause' } })
+  assert.equal(response.status, 409)
+  assert.equal(response.body.error.code, 'bot_state')
+})
+
+test('a bot fills and settlements list is scoped to its owner', { skip }, async () => {
+  const botId = await createBot()
+  assert.equal((await call(`/v1/bots/${botId}/fills`, { token: 'alice' })).status, 200)
+  assert.equal((await call(`/v1/bots/${botId}/settlements`, { token: 'alice' })).status, 200)
+  assert.equal((await call(`/v1/bots/${botId}/fills`, { token: 'bob' })).status, 404)
+})
+
+/* ------------------------------------------------------------------ backtests */
+
+test('a backtest answers 202 with a status url rather than running inside the request', { skip }, async () => {
+  const response = await call('/v1/backtests', {
+    method: 'POST',
+    token: 'alice',
+    body: { seriesId, strategyId: 'sma_cross', params: { fast: 5, slow: 20 }, startCash: '1000000', seed: 3 },
+  })
+  assert.equal(response.status, 202)
+  assert.equal(response.headers.get('location'), `/v1/backtests/${response.body.backtestId}`)
+  assert.deepEqual(enqueued, [{ kind: 'backtest.run', key: `backtest:${response.body.backtestId}` }])
+
+  const queued = await call(response.body.statusUrl, { token: 'alice' })
+  assert.equal(queued.status, 200, JSON.stringify(queued.body))
+  assert.equal(queued.body.backtest.status, 'queued')
+})
+
+test('a queued backtest runs to a stored result with a digest', { skip }, async () => {
+  const response = await call('/v1/backtests', {
+    method: 'POST',
+    token: 'alice',
+    body: { seriesId, strategyId: 'sma_cross', params: { fast: 5, slow: 20 }, startCash: '1000000', seed: 3 },
+  })
+  const id = response.body.backtestId as string
+  assert.equal(await runBacktest({ sql: db, logger: quietLogger() }, id), 'complete')
+
+  const done = await call(`/v1/backtests/${id}`, { token: 'alice' })
+  assert.equal(done.body.backtest.status, 'complete')
+  assert.equal(typeof done.body.backtest.resultDigest, 'string')
+  assert.equal(typeof done.body.backtest.metrics.endEquity, 'string')
+})
+
+test('two runs of one queued configuration agree, because the seed is stored with it', { skip }, async () => {
+  const body = { seriesId, strategyId: 'sma_cross', params: { fast: 5, slow: 20 }, startCash: '1000000', seed: 11 }
+  const a = await call('/v1/backtests', { method: 'POST', token: 'alice', body })
+  const b = await call('/v1/backtests', { method: 'POST', token: 'alice', body })
+  await runBacktest({ sql: db, logger: quietLogger() }, a.body.backtestId)
+  await runBacktest({ sql: db, logger: quietLogger() }, b.body.backtestId)
+
+  const first = await call(`/v1/backtests/${a.body.backtestId}`, { token: 'alice' })
+  const second = await call(`/v1/backtests/${b.body.backtestId}`, { token: 'alice' })
+  assert.equal(first.body.backtest.resultDigest, second.body.backtest.resultDigest)
+})
+
+test('a run over too short a series fails with a reason rather than a meaningless result', { skip }, async () => {
+  const shortId = await seedSeries(db, makeBars({ count: 5 }), { symbol: 'SOL-USD', assetCode: 'SOL' })
+  const response = await call('/v1/backtests', {
+    method: 'POST',
+    token: 'alice',
+    body: { seriesId: shortId, strategyId: 'buy_hold', startCash: '1000', seed: 0 },
+  })
+  assert.equal(await runBacktest({ sql: db, logger: quietLogger() }, response.body.backtestId), 'failed')
+  const done = await call(`/v1/backtests/${response.body.backtestId}`, { token: 'alice' })
+  assert.equal(done.body.backtest.status, 'failed')
+  assert.match(done.body.backtest.error, /not enough to draw a conclusion/)
+})
+
+test('a clamped parameter is reported on the run rather than silently applied', { skip }, async () => {
+  const response = await call('/v1/backtests', {
+    method: 'POST',
+    token: 'alice',
+    body: { seriesId, strategyId: 'sma_cross', params: { fast: 9_999 }, startCash: '1000000' },
+  })
+  assert.ok((response.body.notes as string[]).some((note) => note.includes('clamped')))
+})
+
+test('an out-of-range seed is refused, so a run cannot be unreproducible by accident', { skip }, async () => {
+  const response = await call('/v1/backtests', {
+    method: 'POST',
+    token: 'alice',
+    body: { seriesId, strategyId: 'buy_hold', startCash: '1000', seed: -1 },
+  })
+  assert.equal(response.status, 400)
+})
+
+/* ------------------------------------------------------------------ series ingest */
+
+test('bars are ingested as scaled integer strings, and a replay accepts none twice', { skip }, async () => {
+  const fresh = await call('/v1/series', {
+    method: 'POST',
+    token: 'admin',
+    body: { symbol: 'XRP-USD', assetCode: 'XRP', timeframe: '1h', source: 'fixture' },
+  })
+  const id = fresh.body.series.id as string
+  const bars = makeBars({ count: 3, widthSeconds: BAR_WIDTH }).map((bar) => ({
+    t: bar.t,
+    o: bar.o.toString(),
+    h: bar.h.toString(),
+    l: bar.l.toString(),
+    c: bar.c.toString(),
+  }))
+
+  const key = freshKey()
+  const first = await call(`/v1/series/${id}/bars`, { method: 'POST', token: 'admin', body: { bars }, key })
+  assert.equal(first.status, 201)
+  assert.equal(first.body.accepted, 3)
+
+  const replay = await call(`/v1/series/${id}/bars`, { method: 'POST', token: 'admin', body: { bars }, key })
+  assert.equal(replay.status, 200)
+  assert.equal(replay.body.accepted, 3, 'a replay must report what the original did')
+})
+
+test('a price sent as a JSON number is refused, because a double has already lost it', { skip }, async () => {
+  const response = await call(`/v1/series/${seriesId}/bars`, {
+    method: 'POST',
+    token: 'admin',
+    body: { bars: [{ t: NEWEST.t - BAR_WIDTH, o: 1, h: 1, l: 1, c: 1 }] },
+  })
+  assert.equal(response.status, 400)
+  assert.match(response.body.error.message, /scaled integer as a decimal string/)
+})
+
+test('an unclosed bar is refused at ingest, not stored and quietly traded on', { skip }, async () => {
+  const open = NEWEST.t + BAR_WIDTH
+  const response = await call(`/v1/series/${seriesId}/bars`, {
+    method: 'POST',
+    token: 'admin',
+    body: { bars: [{ t: open, o: '1000000', h: '1000000', l: '1000000', c: '1000000' }] },
+  })
+  assert.equal(response.status, 400)
+  assert.match(response.body.error.message, /has not closed/)
+})
+
+/* ------------------------------------------------------------------ the events webhook */
+
+async function postEvent(envelope: Record<string, unknown>, signature?: string): Promise<{ status: number; body: any }> {
+  const body = JSON.stringify(envelope)
+  const response = await fetch(`${baseUrl}/v1/events`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'x-cloudsforge-signature': signature ?? signEvent(body, EVENT_SECRET),
+    },
+    body,
+  })
+  const text = await response.text()
+  return { status: response.status, body: text.length > 0 ? JSON.parse(text) : {} }
+}
+
+const deletedEnvelope = (id = '33333333-3333-4333-8333-333333333333', userId = ALICE) => ({
+  id,
+  topic: 'identity.user.deleted',
+  key: userId,
+  occurredAt: '2026-01-01T00:00:00.000Z',
+  producer: 'identity',
+  version: 1,
+  payload: { userId },
+})
+
+test('an event with no valid signature is refused before its body is parsed', { skip }, async () => {
+  const response = await postEvent(deletedEnvelope(), 'sha256=deadbeef')
+  assert.equal(response.status, 403)
+  assert.equal(response.body.error.code, 'bad_signature')
+})
+
+test('an event for a topic this service does not subscribe to is acknowledged and ignored', { skip }, async () => {
+  // Never a 4xx: that would make the producer retry the same event for ever.
+  const response = await postEvent({ ...deletedEnvelope(), topic: 'billing.invoice.paid' })
+  assert.equal(response.status, 202)
+  assert.equal(response.body.status, 'ignored')
+})
+
+test('a deleted user has their bots erased, and a redelivery is a no-op', { skip }, async () => {
+  const botId = await createBot()
+  const bobBot = await createBot({}, 'bob')
+
+  const first = await postEvent(deletedEnvelope())
+  assert.equal(first.status, 202)
+  assert.equal(first.body.status, 'recorded')
+
+  const second = await postEvent(deletedEnvelope())
+  assert.equal(second.body.status, 'duplicate', 'a redelivery must not re-run the handler')
+
+  const rows = await sql<{ id: string }[]>`select id from bots`
+  assert.deepEqual(rows.map((row) => row.id), [bobBot])
+  void botId
+})
+
+test('an erasure event with no user id is a 400 rather than deleting nothing quietly', { skip }, async () => {
+  const response = await postEvent({ ...deletedEnvelope(), payload: {} })
+  assert.equal(response.status, 400)
+})
+
+/* ------------------------------------------------------------------ bodies */
+
+test('a malformed body is a 400 with the standard shape', { skip }, async () => {
+  const response = await fetch(`${baseUrl}/v1/bots`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: 'Bearer alice', 'idempotency-key': freshKey() },
+    body: '{ not json',
+  })
+  assert.equal(response.status, 400)
+})
+
+test('an oversized body is refused part-way through, and the connection is not reused', { skip }, async () => {
+  // Two outcomes are both correct here, and which one a client sees depends on how much of its body
+  // was already in flight: a 400, or a closed connection while it was still writing. Refusing EARLY
+  // is the property that matters — an unbounded body is a memory-exhaustion primitive any
+  // unauthenticated caller can reach — and having refused without reading the remainder, the socket
+  // cannot be reused: the unread tail would be parsed as the start of the next request.
+  //
+  // Asserting only the 400 would be asserting the friendlier of the two, and would fail on the
+  // safer one.
+  let refused = false
+  try {
+    const response = await fetch(`${baseUrl}/v1/bots`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: 'Bearer alice', 'idempotency-key': freshKey() },
+      body: JSON.stringify({ name: 'x'.repeat(2 * 1024 * 1024) }),
+    })
+    refused = response.status === 400
+  } catch {
+    // The server closed the socket mid-upload. That IS the refusal.
+    refused = true
+  }
+  assert.ok(refused, 'an oversized body was accepted')
+
+  // The next request must be unaffected — which is what the connection header buys.
+  assert.equal((await call('/livez')).status, 200)
+})
+
+test('an id that is not a uuid is a 400 rather than a database error', { skip }, async () => {
+  assert.equal((await call('/v1/bots/not-a-uuid', { token: 'alice' })).status, 400)
+})

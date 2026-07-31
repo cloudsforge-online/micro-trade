@@ -1,0 +1,245 @@
+/**
+ * Backtests, as rows and as work.
+ *
+ * **The one behavioural change from the frozen service.** It runs a backtest inside the POST
+ * (`crucible/services/crucible/src/routes/backtests.ts:30-128`) and argues the case in its own
+ * comment at `:26-29`: "A thousand candles through ten indicators is single-digit milliseconds; the
+ * only slow part is the feed … A job queue here would buy nothing but a polling endpoint and a way
+ * for a result to go missing."
+ *
+ * That argument is right about the cost and wrong about the risk. The failure it does not account
+ * for is the **drain**: a SIGTERM arrives, the process has ten seconds, and an in-flight run dies
+ * with the request — and because the row was written `queued` before the work started, the user is
+ * left with a run that never completes and nothing to retry it. Deploys are frequent and backtests
+ * are the thing users do most.
+ *
+ * So the route answers **202 with a status url** and `backtest.run` does the work under a lease. The
+ * cost is the polling endpoint the frozen comment predicted; the benefit is that a run survives a
+ * deploy, is retried on failure with a bounded attempt budget, and cannot be lost.
+ *
+ * The lease key is `backtest:<id>` — the contended resource is that run, and two workers completing
+ * one run would race on `result_digest`.
+ */
+
+import { Logger } from '@cloudsforge/telemetry'
+import type { AssetCode } from '@cloudsforge/contracts-chain'
+import { amountFrom } from './money.ts'
+import { run, serialiseResult } from './backtest.ts'
+import { loadAllBars, getSeries } from './series.ts'
+import { isStrategyId, type StrategyId, type StrategyParams } from './catalog.ts'
+import type { Db, Tx } from './outbox.ts'
+
+/** Fewest bars a run may draw a conclusion from. Below this the statistics are noise. */
+export const MIN_BARS = 60
+
+/** Most bars one run may read, so a single request cannot pull an unbounded series into memory. */
+export const MAX_BARS = 20_000
+
+export type BacktestStatus = 'queued' | 'running' | 'complete' | 'failed'
+
+export interface BacktestRecord {
+  readonly id: string
+  readonly userId: string
+  readonly status: BacktestStatus
+  readonly seriesId: string
+  readonly strategyId: StrategyId
+  readonly params: StrategyParams
+  readonly seed: number
+  readonly startCash: bigint
+  readonly feeBps: number
+  readonly slippageBps: number
+  readonly fromT: number | null
+  readonly toT: number | null
+  readonly resultDigest: string | null
+  readonly metrics: unknown
+  readonly notes: readonly string[]
+  readonly error: string | null
+}
+
+interface BacktestRow {
+  readonly id: string
+  readonly user_id: string
+  readonly status: string
+  readonly series_id: string
+  readonly strategy_id: string
+  readonly params: StrategyParams
+  readonly seed: string | number
+  readonly start_cash: string
+  readonly fee_bps: number
+  readonly slippage_bps: number
+  readonly from_t: string | number | null
+  readonly to_t: string | number | null
+  readonly result_digest: string | null
+  readonly metrics: unknown
+  readonly notes: readonly string[]
+  readonly error: string | null
+}
+
+const COLUMNS = `id, user_id, status, series_id, strategy_id, params, seed, start_cash, fee_bps,
+  slippage_bps, from_t, to_t, result_digest, metrics, notes, error`
+
+function toBacktest(row: BacktestRow): BacktestRecord {
+  if (!isStrategyId(row.strategy_id)) {
+    throw new Error(`backtest ${row.id} names an unknown strategy ${row.strategy_id}`)
+  }
+  return {
+    id: row.id,
+    userId: row.user_id,
+    status: row.status as BacktestStatus,
+    seriesId: row.series_id,
+    strategyId: row.strategy_id,
+    params: row.params,
+    seed: Number(row.seed),
+    startCash: amountFrom(row.start_cash),
+    feeBps: row.fee_bps,
+    slippageBps: row.slippage_bps,
+    fromT: row.from_t === null ? null : Number(row.from_t),
+    toT: row.to_t === null ? null : Number(row.to_t),
+    resultDigest: row.result_digest,
+    metrics: row.metrics,
+    notes: row.notes ?? [],
+    error: row.error,
+  }
+}
+
+export interface QueueBacktestInput {
+  readonly userId: string
+  readonly seriesId: string
+  readonly strategyId: StrategyId
+  readonly params: StrategyParams
+  readonly seed: number
+  readonly startCash: bigint
+  readonly feeBps: number
+  readonly slippageBps: number
+  readonly notes: readonly string[]
+}
+
+export async function queueBacktest(sql: Db | Tx, input: QueueBacktestInput): Promise<BacktestRecord> {
+  const rows = await sql<BacktestRow[]>`
+    insert into backtests (user_id, series_id, strategy_id, params, seed, start_cash, fee_bps, slippage_bps, notes)
+    values (
+      ${input.userId}, ${input.seriesId}, ${input.strategyId},
+      ${sql.json(input.params as Record<string, never>)}, ${input.seed},
+      ${input.startCash.toString()}, ${input.feeBps}, ${input.slippageBps},
+      ${sql.json(input.notes as unknown as Record<string, never>)}
+    )
+    returning ${sql.unsafe(COLUMNS)}
+  `
+  const row = rows[0]
+  if (!row) throw new Error('backtest insert returned no row')
+  return toBacktest(row)
+}
+
+export async function getBacktest(sql: Db, id: string): Promise<BacktestRecord | null> {
+  const rows = await sql<BacktestRow[]>`select ${sql.unsafe(COLUMNS)} from backtests where id = ${id}`
+  const row = rows[0]
+  return row ? toBacktest(row) : null
+}
+
+export async function getOwnedBacktest(sql: Db, id: string, userId: string): Promise<BacktestRecord | null> {
+  const rows = await sql<BacktestRow[]>`
+    select ${sql.unsafe(COLUMNS)} from backtests where id = ${id} and user_id = ${userId}
+  `
+  const row = rows[0]
+  return row ? toBacktest(row) : null
+}
+
+export async function listBacktests(sql: Db, userId: string, limit: number): Promise<readonly BacktestRecord[]> {
+  const rows = await sql<BacktestRow[]>`
+    select ${sql.unsafe(COLUMNS)} from backtests where user_id = ${userId} order by created_at desc limit ${limit}
+  `
+  return rows.map(toBacktest)
+}
+
+export interface RunBacktestDeps {
+  readonly sql: Db
+  readonly logger: Logger
+}
+
+export type RunBacktestResult = 'complete' | 'failed' | 'gone' | 'already'
+
+/**
+ * Execute a queued run.
+ *
+ * Idempotent by the same trick the fills use: the claim is a conditional `UPDATE … WHERE status =
+ * 'queued'`. A second worker that finds the row already `running` or `complete` returns `already`
+ * and does nothing, so the digest is written once even if the lease were somehow held twice.
+ */
+export async function runBacktest(deps: RunBacktestDeps, id: string): Promise<RunBacktestResult> {
+  const claimed = await deps.sql<BacktestRow[]>`
+    update backtests set status = 'running' where id = ${id} and status = 'queued'
+    returning ${deps.sql.unsafe(COLUMNS)}
+  `
+  const row = claimed[0]
+  if (!row) {
+    const exists = await getBacktest(deps.sql, id)
+    return exists ? 'already' : 'gone'
+  }
+  const backtest = toBacktest(row)
+
+  try {
+    const series = await getSeries(deps.sql, backtest.seriesId)
+    if (!series) throw new Error('the series this run names no longer exists')
+
+    const bars = await loadAllBars(deps.sql, backtest.seriesId)
+    if (bars.length < MIN_BARS) {
+      await fail(
+        deps.sql,
+        id,
+        `only ${bars.length} bars available for ${series.symbol} ${series.timeframe} — not enough to draw a conclusion from`,
+      )
+      return 'failed'
+    }
+    const window = bars.length > MAX_BARS ? bars.slice(bars.length - MAX_BARS) : bars
+
+    const result = run({
+      bars: window,
+      strategyId: backtest.strategyId,
+      params: backtest.params,
+      timeframe: series.timeframe,
+      asset: series.assetCode as AssetCode,
+      startCash: backtest.startCash,
+      feeBps: backtest.feeBps,
+      slippageBps: backtest.slippageBps,
+      seed: backtest.seed,
+    })
+
+    const notes = [...backtest.notes]
+    if (result.metrics.trades === 0) {
+      notes.push('this configuration produced no trades at all — the parameters are probably too slow for the window')
+    }
+    if (bars.length > MAX_BARS) {
+      notes.push(`the series has ${bars.length} bars; the newest ${MAX_BARS} were used`)
+    }
+
+    const stored = serialiseResult(result)
+    await deps.sql`
+      update backtests
+         set status        = 'complete',
+             from_t        = ${result.from},
+             to_t          = ${result.to},
+             result_digest = ${result.digest},
+             metrics       = ${deps.sql.json(stored['metrics'] as Record<string, never>)},
+             trades        = ${deps.sql.json(stored['fills'] as unknown as Record<string, never>)},
+             equity        = ${deps.sql.json(stored['equity'] as unknown as Record<string, never>)},
+             notes         = ${deps.sql.json(notes as unknown as Record<string, never>)},
+             error         = null,
+             completed_at  = now()
+       where id = ${id}
+    `
+    return 'complete'
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err)
+    deps.logger.error('backtest failed', { backtestId: id, err: message })
+    await fail(deps.sql, id, message)
+    return 'failed'
+  }
+}
+
+async function fail(sql: Db, id: string, message: string): Promise<void> {
+  await sql`
+    update backtests
+       set status = 'failed', error = ${message.slice(0, 2_000)}, completed_at = now()
+     where id = ${id}
+  `
+}

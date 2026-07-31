@@ -1,0 +1,14 @@
+# Third-party packages must be at least this old before install will take them.
+# It is a supply-chain control: a malicious version published an hour ago is the
+# shape most registry attacks take, and none of them survive a week.
+minimumReleaseAge: 10080
+
+# @cloudsforge/* are first-party and are exempt — waiting a week to consume our
+# own release would make the polyrepo unworkable. See docs/ecosystem/02 AD-02.
+minimumReleaseAgeExclude:
+  - '@cloudsforge/*'
+
+# Omitting this makes install rewrite the file with placeholders.
+allowBuilds:
+  esbuild: false
+strictDepBuilds: false

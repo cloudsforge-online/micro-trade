@@ -1,0 +1,172 @@
+name: CI
+
+# Two jobs, and the split between them is a statement about micro-org rather than about this
+# repository.
+#
+# `estate` calls the shared reusable workflow, which is where the cross-cutting rules live: one
+# database per service, no cross-service source imports, /livez + /readyz + /metrics, no env_file
+# fan-out, no setInterval doing domain work, and an image that starts and answers /livez. The
+# measured target in docs/ecosystem/03 §5 is zero bespoke CI files, and calling it is how this
+# repository counts toward that zero rather than against it.
+#
+# `database` is the part the reusable workflow cannot do yet, and it is a gap in micro-org rather
+# than a preference here: `service-ci.yml`'s build job has **no Postgres service container**, so a
+# suite that tests against a real database cannot run in it. This repository's suite is 227 tests and
+# most of them touch Postgres — including every proof that two workers cannot double-bill a fee or
+# double-apply a fill, which is the entire reason the service was rewritten. Running those against a
+# fixture would be running them against the fixture.
+#
+# The reusable workflow's own `pnpm test` still passes: `src/testsupport.ts` skips the
+# database-backed cases when TRADE_TEST_DSN is unset, with a reason attached. That is a real
+# limitation, not a workaround — those cases have not run until the job below runs them.
+#
+# **Delete `database` the day `service-ci.yml` gains a `postgres-service` input.** Two findings are
+# recorded in README.md under "Findings against micro-org"; this file is the second one.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  estate:
+    uses: cloudsforge-online/micro-org/.github/workflows/service-ci.yml@main
+    with:
+      service: trade
+      database-env-var: TRADE_DATABASE_URL
+      port: 4000
+    permissions:
+      contents: read
+      packages: read
+
+  database:
+    name: The suite, against a real Postgres
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        # Not a secret: this database exists for the duration of one job, is reachable only from it,
+        # and holds nothing. A real value here would be a real value in a public log.
+        env:
+          POSTGRES_USER: trade
+          POSTGRES_PASSWORD: trade
+          POSTGRES_DB: trade_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U trade"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      # Temporary: the three checkouts and the sibling layout exist only because the runtime and
+      # contracts packages are unpublished. On publish this collapses to one checkout.
+      - uses: actions/checkout@v4
+        with: { path: trade }
+      - uses: actions/checkout@v4
+        with: { repository: cloudsforge-online/micro-runtime, path: runtime }
+      - uses: actions/checkout@v4
+        with: { repository: cloudsforge-online/micro-contracts, path: contracts }
+
+      - uses: pnpm/action-setup@v4
+        with: { version: 11.9.0 }
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: trade/pnpm-lock.yaml
+
+      - name: Install
+        working-directory: trade
+        run: pnpm install --frozen-lockfile
+
+      - name: Migrate the test database
+        working-directory: trade
+        # The migrator is exercised AS a migrator, on an empty database, exactly as a deploy runs it.
+        # A schema created by the test suite instead would never prove the one-shot job works — and
+        # the two constraints this service exists to add only exist because that job ran.
+        env:
+          TRADE_DATABASE_URL: postgres://trade:trade@127.0.0.1:5432/trade_test
+          IDENTITY_JWKS_URL: http://127.0.0.1:4001/.well-known/jwks.json
+          IDENTITY_ISSUER: http://127.0.0.1:4001
+          OUTBOX_SIGNING_SECRET: ci-only-not-a-real-secret-000000000000
+          LEDGER_URL: http://127.0.0.1:4007
+          PRICING_URL: http://127.0.0.1:4006
+          BILLING_URL: http://127.0.0.1:4009
+          TRADE_SERVICE_TOKEN: ci-only-not-a-real-token-0000000000000
+        run: pnpm migrate
+
+      - name: Test
+        working-directory: trade
+        env:
+          TRADE_TEST_DSN: postgres://trade:trade@127.0.0.1:5432/trade_test
+        run: pnpm test
+
+      # A skip is never counted as a pass (docs/ecosystem/14 §16). If TRADE_TEST_DSN failed to reach
+      # the suite, every database-backed case would silently skip and the job would still be green —
+      # which would hide the loss of every concurrency proof in the repository.
+      - name: No test was skipped
+        working-directory: trade
+        env:
+          TRADE_TEST_DSN: postgres://trade:trade@127.0.0.1:5432/trade_test
+        run: |
+          set -uo pipefail
+          output=$(pnpm test 2>&1) || { echo "$output"; exit 1; }
+          skipped=$(printf '%s\n' "$output" | grep -oE '^# skipped [0-9]+$' | grep -oE '[0-9]+' || echo 0)
+          echo "skipped: ${skipped:-0}"
+          [ "${skipped:-0}" = "0" ] || { echo "::error::${skipped} tests were skipped"; exit 1; }
+
+  rules:
+    name: The two controls this service exists to add
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Asserted as text so they cannot be deleted in a refactor without a red build. The tests prove
+      # they WORK; these prove they are still THERE.
+      - name: The settlement and fill uniqueness constraints still exist
+        run: |
+          grep -q 'fee_settlements_bot_period_uniq' src/migrations.ts \
+            || { echo '::error::the per-period settlement constraint is gone; performance fees can be double-billed'; exit 1; }
+          grep -q 'fills_bot_bar_side_uniq' src/migrations.ts \
+            || { echo '::error::the per-bar fill constraint is gone; a restart mid-tick can trade twice'; exit 1; }
+
+      - name: The settlement key is still derived, never random
+        run: |
+          if grep -rn 'randomUUID' src/ --include='*.ts' | grep -v '\.test\.ts'; then
+            echo '::error::a random id appears in the source. The frozen service derives its upstream'
+            echo 'idempotency key from randomUUID() (crucible store.ts:452), which is what lets two'
+            echo 'attempts at one settlement mint two keys. Keys here are derived from (bot, period).'
+            exit 1
+          fi
+
+      - name: A backtest still answers 202 rather than running inside the request
+        run: |
+          grep -q 'status: 202' src/server.ts \
+            || { echo '::error::the backtest route no longer answers 202; a run would die with the drain'; exit 1; }
+
+      - name: The erasure webhook still verifies a signature
+        run: |
+          grep -q 'timingSafeEqual' src/server.ts \
+            || { echo '::error::the event signature check is gone; POST /v1/events is a delete-anyone endpoint'; exit 1; }
+
+      # A `*/` in the MIDDLE of a block comment terminates it early and silently uncomments whatever
+      # follows. The pattern matches a continuation line of a block comment (leading `*`) that carries
+      # a `*/` with more text after it — the only shape that does damage.
+      - name: No comment-terminating sequence inside a block comment
+        run: |
+          if grep -rnE '^\s*\*.*\*/.+' src/ --include='*.ts'; then
+            echo '::error::a */ appears mid-way through a block comment and terminates it early'
+            exit 1
+          fi
+
+  hygiene:
+    uses: cloudsforge-online/micro-org/.github/workflows/secret-hygiene.yml@main
+    permissions:
+      contents: read
