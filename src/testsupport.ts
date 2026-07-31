@@ -46,33 +46,24 @@ export const BOB = '22222222-2222-4222-8222-222222222222'
  * only record of which fills were settled and which fees were charged; the wrong connection string
  * here destroys the evidence every double-billing investigation would ever run on.
  *
- * ## Why the variable is `TRADE_TEST_DSN` and not the sibling spelling
+ * ## The variable is `TRADE_TEST_DATABASE_URL`, as in every sibling
  *
- * Every sibling names its test connection string `<service>_test_database_url` (in upper case), and
- * this repository deliberately does not — the name is written in lower case here for a reason given
- * at the end of this note. The
- * org's reusable `service-ci.yml` enforces rule 1 by grepping `src/` for
- * `[A-Z][A-Z0-9_]*_(DATABASE_URL|DB_URL|POSTGRES_URL)` and failing on anything that is not the ONE
- * declared database variable — with no exemption for a test-only DSN. The siblings do not trip it
- * only because none of them calls the reusable workflow yet; each has a bespoke CI file that
- * whitelists both names, which is the thing 03 §5 is trying to get to zero.
+ * It was briefly `TRADE_TEST_DSN`, to dodge two defects in the org's reusable `service-ci.yml`
+ * that this repository found and reported: rule 1 compared reads against the one declared database
+ * variable by exact string, so a service's own test DSN counted as another service's database; and
+ * it grepped raw source, so naming the rejected spelling in a comment explaining the rejection
+ * failed the build. Both are fixed in `micro-org` — the rule now compares namespaces and strips
+ * comments first — so the workaround is gone and the name matches the other fifteen services.
  *
- * Renaming the variable is the cheap half of the fix and it costs nothing: this is a test-only
- * connection string to this service's own database, which is not what rule 1 is about. The other
- * half — teaching `service-ci.yml` to exempt one declared test variable — belongs in `micro-org`,
- * and is recorded in this repository's README rather than worked around silently.
- *
- * And the reason the sibling name appears in lower case above: the rule-1 check greps for the
- * PATTERN, not for a declaration, so writing the rejected name in upper case in this very comment
- * fails the build. A check that cannot tell a variable from a sentence about one is a check people
- * learn to work around by rewording comments — which is exactly what this paragraph is. It is the
- * third finding against `micro-org`, and it is in the README too.
+ * Keeping it would have been worse than untidy. CI exports the DSN as
+ * `<SERVICE>_TEST_DATABASE_URL`; a suite reading a differently-spelled variable would not have
+ * found it, would have skipped every database test, and would have reported green.
  */
-const url = process.env['TRADE_TEST_DSN']
+const url = process.env['TRADE_TEST_DATABASE_URL']
 
 export const enabled = Boolean(url && /test/i.test(url))
 
-export const skip = enabled ? false : 'set TRADE_TEST_DSN (name must contain "test")'
+export const skip = enabled ? false : 'set TRADE_TEST_DATABASE_URL (name must contain "test")'
 
 export function openDb(max = 8): postgres.Sql {
   if (!enabled) throw new Error('database tests are disabled')

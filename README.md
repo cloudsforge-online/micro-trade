@@ -114,26 +114,33 @@ inherited statements did not survive that:
    `insertSettlement` (actually `:452`) and `runner.ts:437`/`:440` for the two timers (actually
    `:510`/`:513`). The findings behind them are real; the coordinates are not.
 
-## Findings against `micro-org`
+## Findings against `micro-org` — all three now fixed upstream
 
-Recorded rather than worked around silently. Both concern `.github/workflows/service-ci.yml`.
+Recorded rather than worked around silently, and acted on. All three concerned
+`.github/workflows/service-ci.yml`, and all three had the same cause: no repository had yet pushed,
+so the workflow every service calls had never once run.
 
-1. **The `build` job has no Postgres service container**, so a database-backed suite cannot run in
-   the reusable workflow. Every sibling avoids this by keeping a bespoke CI file, which is the thing
-   03 §5 is trying to drive to zero. This repository calls the reusable workflow *and* carries one
-   extra job that provides a database; the extra job should be deleted the day `service-ci.yml`
-   gains a `postgres-service` input.
-2. **Rule 1's check has no exemption for a test-only DSN.** It greps `src/` for
-   `[A-Z][A-Z0-9_]*_(DATABASE_URL|DB_URL|POSTGRES_URL)` and fails on anything that is not the one
-   declared database variable — so the `<service>_test_database_url` name every sibling uses would
-   fail it. This repository names its test variable `TRADE_TEST_DSN` to stay green, which is the
-   cheap half of the fix; the other half belongs in `micro-org`.
+1. **The `build` job had no Postgres service container**, so a database-backed suite could not run
+   in the reusable workflow. The consequence was not a red pipeline — every `testsupport.ts` in the
+   estate *skips* when its DSN is absent, so CI would have gone green having executed none of the
+   assertions it exists for. `service-ci.yml` now starts one (`postgres: true` by default, database
+   named `ci_test` because the suites refuse a name without "test" in it) and **fails the build if
+   the database tests skipped**. The extra job this repository carried has been deleted.
+2. **Rule 1 had no exemption for a test-only DSN.** It compared reads against the one declared
+   database variable by exact string, so `<SERVICE>_TEST_DATABASE_URL` — which every sibling reads
+   by construction — counted as another service's database. The rule rejected all fifteen services
+   it exists to protect. It now compares namespaces, so this repository has been renamed back to
+   `TRADE_TEST_DATABASE_URL` and matches its siblings again.
+3. **That same check matched prose, not declarations.** Writing the rejected variable name in a
+   comment *explaining why it is rejected* failed the build. Comments are now stripped first,
+   multi-line `/** … */` blocks included, which is where this estate documents every boundary.
+   `worlds`' own CI file had already anticipated this class of problem for rule 8 — "a check that
+   cannot tell a timer from a sentence about one is a check people learn to ignore" — and rule 1
+   had the same defect without the same guard.
 
-3. **That same check matches prose, not declarations.** Writing the rejected variable name in a
-   comment *explaining why it is rejected* fails the build, so the note in `src/testsupport.ts` is
-   written in lower case. `worlds`' own CI file already anticipates this class of problem for rule 8
-   — "a check that cannot tell a timer from a sentence about one is a check people learn to ignore" —
-   and rule 1 has the same defect without the same guard.
+A fourth, found separately: `secret-hygiene.yml` recognised `changeme` but not `CHANGE_ME`, failing
+five services on placeholders that could not be mistaken for credentials — while passing a remote
+`postgres://` DSN carrying its own password. Both fixed.
 
 ---
 
@@ -165,7 +172,7 @@ src/
 `node:test` against a real Postgres. **227 tests, zero skipped.**
 
 ```
-TRADE_TEST_DSN=postgres://…/trade_test pnpm test
+TRADE_TEST_DATABASE_URL=postgres://…/trade_test pnpm test
 ```
 
 The ones that carry the argument:

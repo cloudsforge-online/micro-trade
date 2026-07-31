@@ -9,19 +9,15 @@ name: CI
 # measured target in docs/ecosystem/03 §5 is zero bespoke CI files, and calling it is how this
 # repository counts toward that zero rather than against it.
 #
-# `database` is the part the reusable workflow cannot do yet, and it is a gap in micro-org rather
-# than a preference here: `service-ci.yml`'s build job has **no Postgres service container**, so a
-# suite that tests against a real database cannot run in it. This repository's suite is 227 tests and
-# most of them touch Postgres — including every proof that two workers cannot double-bill a fee or
-# double-apply a fill, which is the entire reason the service was rewritten. Running those against a
-# fixture would be running them against the fixture.
+# `migrate` is what the reusable workflow still does not do. `service-ci.yml` now provides a Postgres
+# container and fails the build if the database suite skipped — the two gaps this file used to cover
+# — so the duplicated suite run has been deleted. It ran `pnpm test` TWICE, once to test and once to
+# count skips, which doubled the slowest job in the repository to answer a question the reusable
+# workflow now answers for free.
 #
-# The reusable workflow's own `pnpm test` still passes: `src/testsupport.ts` skips the
-# database-backed cases when TRADE_TEST_DSN is unset, with a reason attached. That is a real
-# limitation, not a workaround — those cases have not run until the job below runs them.
-#
-# **Delete `database` the day `service-ci.yml` gains a `postgres-service` input.** Two findings are
-# recorded in README.md under "Findings against micro-org"; this file is the second one.
+# What remains is the one thing still unique: exercising the migrator AS a migrator, on an empty
+# database, exactly as a deploy runs it. A schema created by the test suite would never prove the
+# one-shot job works — and the two constraints this service exists to add only exist because it ran.
 
 on:
   push:
@@ -46,8 +42,8 @@ jobs:
       contents: read
       packages: read
 
-  database:
-    name: The suite, against a real Postgres
+  migrate:
+    name: The migrator, on an empty database
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -88,9 +84,6 @@ jobs:
 
       - name: Migrate the test database
         working-directory: trade
-        # The migrator is exercised AS a migrator, on an empty database, exactly as a deploy runs it.
-        # A schema created by the test suite instead would never prove the one-shot job works — and
-        # the two constraints this service exists to add only exist because that job ran.
         env:
           TRADE_DATABASE_URL: postgres://trade:trade@127.0.0.1:5432/trade_test
           IDENTITY_JWKS_URL: http://127.0.0.1:4001/.well-known/jwks.json
@@ -102,25 +95,20 @@ jobs:
           TRADE_SERVICE_TOKEN: ci-only-not-a-real-token-0000000000000
         run: pnpm migrate
 
-      - name: Test
+      - name: Migrating twice is a no-op
         working-directory: trade
+        # A deploy re-runs the one-shot job on every release. A migrator that is not idempotent
+        # turns the second deploy of an unchanged schema into an outage.
         env:
-          TRADE_TEST_DSN: postgres://trade:trade@127.0.0.1:5432/trade_test
-        run: pnpm test
-
-      # A skip is never counted as a pass (docs/ecosystem/14 §16). If TRADE_TEST_DSN failed to reach
-      # the suite, every database-backed case would silently skip and the job would still be green —
-      # which would hide the loss of every concurrency proof in the repository.
-      - name: No test was skipped
-        working-directory: trade
-        env:
-          TRADE_TEST_DSN: postgres://trade:trade@127.0.0.1:5432/trade_test
-        run: |
-          set -uo pipefail
-          output=$(pnpm test 2>&1) || { echo "$output"; exit 1; }
-          skipped=$(printf '%s\n' "$output" | grep -oE '^# skipped [0-9]+$' | grep -oE '[0-9]+' || echo 0)
-          echo "skipped: ${skipped:-0}"
-          [ "${skipped:-0}" = "0" ] || { echo "::error::${skipped} tests were skipped"; exit 1; }
+          TRADE_DATABASE_URL: postgres://trade:trade@127.0.0.1:5432/trade_test
+          IDENTITY_JWKS_URL: http://127.0.0.1:4001/.well-known/jwks.json
+          IDENTITY_ISSUER: http://127.0.0.1:4001
+          OUTBOX_SIGNING_SECRET: ci-only-not-a-real-secret-000000000000
+          LEDGER_URL: http://127.0.0.1:4007
+          PRICING_URL: http://127.0.0.1:4006
+          BILLING_URL: http://127.0.0.1:4009
+          TRADE_SERVICE_TOKEN: ci-only-not-a-real-token-0000000000000
+        run: pnpm migrate
 
   rules:
     name: The two controls this service exists to add
