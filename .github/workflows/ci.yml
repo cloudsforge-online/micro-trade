@@ -38,6 +38,18 @@ jobs:
       service: trade
       database-env-var: TRADE_DATABASE_URL
       port: 4000
+      # The image startup smoke test boots the real service, and `env.ts` validates its
+      # configuration at import — so the container needs every variable it declares, not just a
+      # database, or it exits before it serves /livez. CI-only NON-secrets: throwaway tokens that
+      # clear a length check, URLs that are never dialled because /livez needs no upstream.
+      smoke-env: |
+        IDENTITY_JWKS_URL=http://127.0.0.1:4001/.well-known/jwks.json
+        IDENTITY_ISSUER=http://127.0.0.1:4001
+        OUTBOX_SIGNING_SECRET=ci-only-not-a-real-secret-000000000000
+        LEDGER_URL=http://127.0.0.1:4007
+        PRICING_URL=http://127.0.0.1:4006
+        BILLING_URL=http://127.0.0.1:4009
+        TRADE_SERVICE_TOKEN=ci-only-not-a-real-token-0000000000000
     secrets:
       # @cloudsforge/* resolves via link:../runtime, so the workflow checks out micro-runtime
       # and micro-contracts as siblings — both private, hence a contents:read token.
