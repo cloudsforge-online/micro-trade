@@ -38,6 +38,10 @@ jobs:
       service: trade
       database-env-var: TRADE_DATABASE_URL
       port: 4000
+    secrets:
+      # @cloudsforge/* resolves via link:../runtime, so the workflow checks out micro-runtime
+      # and micro-contracts as siblings — both private, hence a contents:read token.
+      estate_token: ${{ secrets.ESTATE_READ_TOKEN }}
     permissions:
       contents: read
       packages: read
@@ -66,9 +70,9 @@ jobs:
       - uses: actions/checkout@v4
         with: { path: trade }
       - uses: actions/checkout@v4
-        with: { repository: cloudsforge-online/micro-runtime, path: runtime }
+        with: { repository: cloudsforge-online/micro-runtime, path: runtime, token: "${{ secrets.ESTATE_READ_TOKEN }}" }
       - uses: actions/checkout@v4
-        with: { repository: cloudsforge-online/micro-contracts, path: contracts }
+        with: { repository: cloudsforge-online/micro-contracts, path: contracts, token: "${{ secrets.ESTATE_READ_TOKEN }}" }
 
       - uses: pnpm/action-setup@v4
         with: { version: 11.9.0 }
@@ -127,7 +131,15 @@ jobs:
 
       - name: The settlement key is still derived, never random
         run: |
-          if grep -rn 'randomUUID' src/ --include='*.ts' | grep -v '\.test\.ts'; then
+          # Comments are stripped first — the sixth guard in this estate to fire on its own
+          # rationale otherwise: every current use of the word is a comment citing the frozen
+          # store.ts:452 defect this rule exists to prevent.
+          scan=$(mktemp -d)
+          find src -name '*.ts' ! -name '*.test.ts' -print0 | while IFS= read -r -d '' f; do
+            mkdir -p "$scan/$(dirname "$f")"
+            sed -e 's://.*::' "$f" | awk 'BEGIN{inb=0}{l=$0;o="";while(length(l)>0){if(inb){i=index(l,"*/");if(i==0){l="";break}inb=0;l=substr(l,i+2);continue}b=index(l,"/*");if(b>0){o=o substr(l,1,b-1);l=substr(l,b+2);inb=1;continue}o=o l;l=""}print o}' > "$scan/$f"
+          done
+          if grep -rn 'randomUUID' "$scan"; then
             echo '::error::a random id appears in the source. The frozen service derives its upstream'
             echo 'idempotency key from randomUUID() (crucible store.ts:452), which is what lets two'
             echo 'attempts at one settlement mint two keys. Keys here are derived from (bot, period).'
