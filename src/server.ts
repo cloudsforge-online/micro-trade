@@ -68,7 +68,7 @@ import { listSettlements, stopBot, type FeeDeps } from './fees.ts'
 import { BarRejectedError, assertIngestable, getSeries, ingestBars, listSeries, registerSeries } from './series.ts'
 import { RateUnavailableError, type PricingClient } from './pricingclient.ts'
 import { LedgerRefusedError, LedgerUnavailableError, type LedgerClient } from './ledgerclient.ts'
-import { verifyEventSignature, withInbox, withOutbox, type Db } from './outbox.ts'
+import { SIGNATURE_HEADER, verifyEventSignature, withInbox, withOutbox, type Db } from './outbox.ts'
 import type { Clock } from './rng.ts'
 import type { Bar } from './indicators.ts'
 
@@ -120,7 +120,6 @@ export function registerServiceMetrics(metrics: Metrics): Metrics {
 const SAFE_REQUEST_ID = /^[A-Za-z0-9_-]{1,64}$/
 const UUID = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/
 const MAX_BODY_BYTES = 1024 * 1024
-const SIGNATURE_HEADER = 'x-cloudsforge-signature'
 
 /** Topics this service consumes. A topic not in here is acknowledged and ignored, never 4xx'd. */
 const SUBSCRIBED_TOPICS = new Set(['identity.user.deleted'])

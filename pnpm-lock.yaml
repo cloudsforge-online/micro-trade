@@ -17,6 +17,9 @@ importers:
       '@cloudsforge/contracts-chain':
         specifier: link:../contracts/packages/chain
         version: link:../contracts/packages/chain
+      '@cloudsforge/contracts-events':
+        specifier: link:../contracts/packages/events
+        version: link:../contracts/packages/events
       '@cloudsforge/contracts-money':
         specifier: link:../contracts/packages/money
         version: link:../contracts/packages/money

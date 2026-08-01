@@ -572,7 +572,7 @@ async function postEvent(envelope: Record<string, unknown>, signature?: string):
     method: 'POST',
     headers: {
       'content-type': 'application/json',
-      'x-cloudsforge-signature': signature ?? signEvent(body, EVENT_SECRET),
+      'cf-signature': signature ?? signEvent(body, EVENT_SECRET),
     },
     body,
   })
@@ -586,7 +586,7 @@ const deletedEnvelope = (id = '33333333-3333-4333-8333-333333333333', userId = A
   key: userId,
   occurredAt: '2026-01-01T00:00:00.000Z',
   producer: 'identity',
-  version: 1,
+  version: '1.0',
   payload: { userId },
 })
 
