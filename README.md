@@ -83,6 +83,21 @@ Every path below is relative to `stack/repos/crucible/`, which is frozen and unm
   sha256 digest over the stored result. Same strategy + same series + same seed ⇒ byte-identical.
 - **Idempotency on every mutating route**, fingerprinted excluding `correlationId`.
 - **An outbox, an inbox, `/livez`, `/readyz`, `/metrics`, and a drain.**
+- **`GET /v1/backtests/:id/result` (`src/server.ts:447`) — the curve that was computed and served
+  to nobody.** `runBacktest` writes `trades` and `equity` (`src/backtests.ts:222-223`) into columns
+  that exist (`src/migrations.ts:206-207`), but `COLUMNS` (`src/backtests.ts:79-80`) listed neither,
+  so **no read path could reach them**. Every report could say how deep a drawdown was and never
+  when it happened, which is the question a curve exists to answer. Served separately rather than
+  added to `COLUMNS`, so the index page does not pay for a chart nobody has opened. A run that has
+  not completed is a **409 naming its state**, never a 200 with empty arrays: an empty fill list is
+  a real result — a strategy that never traded — and it must not read as "not finished yet".
+- **`GET /v1/capabilities` (`src/server.ts:361`) — what this deployment will actually let you do.**
+  `TRADE_LIVE_ENABLED` defaults to false (`src/env.ts:181`) and is read per tick, and **nothing
+  reported it**: a customer could configure a live bot and learn the switch was off only when it
+  declined to tick. Public and unauthenticated, like the catalogue, because it is a property of the
+  deployment and not of the caller. When live is off the body carries `LIVE_DISABLED`
+  (`src/bots.ts:90`) **verbatim** — the same sentence the engine writes onto a bot it refuses — so
+  a client's warning and the eventual refusal cannot say different things.
 
 ---
 

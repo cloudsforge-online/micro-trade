@@ -144,6 +144,48 @@ export async function getOwnedBacktest(sql: Db, id: string, userId: string): Pro
   return row ? toBacktest(row) : null
 }
 
+/**
+ * The two result columns no read path selected, and why they are read separately.
+ *
+ * `runBacktest` writes `trades` and `equity` alongside `metrics` (see the update in this file),
+ * and `migrations.ts` declares both as `jsonb`. But `COLUMNS` above lists neither, so **nothing
+ * could read them**: a completed backtest computed its equity curve and its fill list, stored
+ * both, and then served only the summary. A client could show how deep a drawdown was and never
+ * when it happened, which is the question the curve exists to answer.
+ *
+ * They stay out of `COLUMNS` deliberately rather than being added to it. `listBacktests` returns
+ * up to `limit` rows, and an equity curve is decimated to `MAX_CURVE_POINTS` — putting both into
+ * every list response would make the index page pay for a chart nobody has opened yet. So this is
+ * a separate read, mirroring `GET /v1/bots/:id/fills`, which is the same shape for the same
+ * reason.
+ *
+ * `null` when the row is absent or not this user's; the arrays are null until the run completes,
+ * which the route reports as a state rather than as an empty result — an empty fill list is a
+ * real answer a strategy can produce, and it must not be confused with "not finished".
+ */
+export interface BacktestResultRows {
+  readonly status: BacktestStatus
+  readonly fills: readonly unknown[] | null
+  readonly equity: readonly unknown[] | null
+}
+
+export async function getOwnedBacktestResult(
+  sql: Db,
+  id: string,
+  userId: string,
+): Promise<BacktestResultRows | null> {
+  const rows = await sql<{ status: string; trades: unknown; equity: unknown }[]>`
+    select status, trades, equity from backtests where id = ${id} and user_id = ${userId}
+  `
+  const row = rows[0]
+  if (!row) return null
+  return {
+    status: row.status as BacktestStatus,
+    fills: Array.isArray(row.trades) ? (row.trades as readonly unknown[]) : null,
+    equity: Array.isArray(row.equity) ? (row.equity as readonly unknown[]) : null,
+  }
+}
+
 export async function listBacktests(sql: Db, userId: string, limit: number): Promise<readonly BacktestRecord[]> {
   const rows = await sql<BacktestRow[]>`
     select ${sql.unsafe(COLUMNS)} from backtests where user_id = ${userId} order by created_at desc limit ${limit}

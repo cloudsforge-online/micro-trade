@@ -45,9 +45,17 @@ import { STRATEGIES, findStrategy, isStrategyId, isTimeframe, normaliseParams, t
 import { amountTo, formatPrice } from './money.ts'
 import { withIdempotency, IdempotencyInFlightError, IdempotencyKeyReuseError, requestFingerprint } from './idempotency.ts'
 import { BACKTEST_KIND } from './jobs.ts'
-import { queueBacktest, getOwnedBacktest, listBacktests, MAX_BARS, type BacktestRecord } from './backtests.ts'
+import {
+  queueBacktest,
+  getOwnedBacktest,
+  getOwnedBacktestResult,
+  listBacktests,
+  MAX_BARS,
+  type BacktestRecord,
+} from './backtests.ts'
 import {
   BotStateError,
+  LIVE_DISABLED,
   getOwnedBot,
   insertBot,
   listBots,
@@ -333,6 +341,35 @@ function buildRoutes(): Route[] {
     // signing up — and gating it behind a token would make the marketing page unable to render it.
     define('GET', '/v1/strategies', async () => ({ status: 200, body: { strategies: STRATEGIES } })),
 
+    /**
+     * What this deployment will actually let you do.
+     *
+     * `TRADE_LIVE_ENABLED` defaults to false, and nothing reported it. A customer could configure
+     * a live bot, be charged for it, and discover only when it refused to tick that live trading
+     * is switched off here — the client had no way to warn them beforehand, because there was no
+     * way to ask.
+     *
+     * Public and unauthenticated, like the catalogue beside it: whether a deployment offers live
+     * trading is a property of the deployment, not of the caller, and a signed-out visitor reading
+     * the product page deserves the same true answer as a signed-in one. Nothing here is derived
+     * from a user.
+     *
+     * The refusal string is `LIVE_DISABLED` verbatim — the same sentence the engine writes onto a
+     * bot it declines to tick. One sentence, one source: a client that renders this is showing the
+     * service's own words rather than a paraphrase that can drift from them.
+     */
+    define('GET', '/v1/capabilities', async (_ctx, deps) => ({
+      status: 200,
+      body: {
+        capabilities: {
+          liveTrading: {
+            enabled: deps.liveEnabled,
+            ...(deps.liveEnabled ? {} : { refusal: LIVE_DISABLED }),
+          },
+        },
+      },
+    })),
+
     define('GET', '/v1/series', async (ctx, deps) => {
       await authenticate(ctx, deps)
       return { status: 200, body: { series: await listSeries(deps.sql) } }
@@ -394,6 +431,34 @@ function buildRoutes(): Route[] {
       const backtest = await getOwnedBacktest(deps.sql, uuidParam(ctx, 'id'), userId)
       if (!backtest) throw new NotFoundError('backtest not found')
       return { status: 200, body: { backtest: backtestView(backtest) } }
+    }),
+
+    /**
+     * The equity curve and the fill list, which were computed, stored, and then served by nothing.
+     *
+     * Separate from `GET /v1/backtests/:id` so the summary stays cheap — see the note on
+     * `getOwnedBacktestResult`. Same ownership rule as the summary: a backtest is scoped to its
+     * owner in the query itself, not by a check after the fact.
+     *
+     * A run that has not completed is a 409 naming its state, not a 200 with empty arrays. An
+     * empty fill list is a real answer — a strategy that never traded — and a client must be able
+     * to tell "it did nothing" from "it has not finished yet".
+     */
+    define('GET', '/v1/backtests/:id/result', async (ctx, deps) => {
+      const principal = await authenticate(ctx, deps)
+      if (principal.kind === 'service') requireScope(principal, READ_SCOPE)
+      const userId = ownerOf(ctx, principal)
+      const result = await getOwnedBacktestResult(deps.sql, uuidParam(ctx, 'id'), userId)
+      if (!result) throw new NotFoundError('backtest not found')
+      if (result.status !== 'complete' || !result.fills || !result.equity) {
+        return errorReply(
+          409,
+          'backtest_not_complete',
+          `this backtest is ${result.status}; a result exists only once it completes`,
+          ctx.requestId,
+        )
+      }
+      return { status: 200, body: { fills: result.fills, equity: result.equity } }
     }),
 
     define('POST', '/v1/backtests', async (ctx, deps) => {

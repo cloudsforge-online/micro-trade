@@ -17,6 +17,7 @@ import { Logger, Metrics, registerHttpMetrics, registerJobMetrics } from '@cloud
 import { createServer, registerServiceMetrics } from './server.ts'
 import { signEvent } from './outbox.ts'
 import { runBacktest } from './backtests.ts'
+import { LIVE_DISABLED } from './bots.ts'
 import { RATE_SCALE } from './money.ts'
 import {
   ALICE,
@@ -409,6 +410,67 @@ test('a queued backtest runs to a stored result with a digest', { skip }, async 
   assert.equal(done.body.backtest.status, 'complete')
   assert.equal(typeof done.body.backtest.resultDigest, 'string')
   assert.equal(typeof done.body.backtest.metrics.endEquity, 'string')
+})
+
+/**
+ * The equity curve and the fill list were computed, stored, and served by nothing.
+ *
+ * `runBacktest` wrote `trades` and `equity`; `COLUMNS` in backtests.ts selected neither, so no read
+ * path could reach them. A client could report how deep a drawdown was and never when it happened.
+ * These four tests are the ones that would have caught it.
+ */
+test('a completed backtest serves the equity curve and the fills it stored', { skip }, async () => {
+  const response = await call('/v1/backtests', {
+    method: 'POST',
+    token: 'alice',
+    body: { seriesId, strategyId: 'sma_cross', params: { fast: 5, slow: 20 }, startCash: '1000000', seed: 3 },
+  })
+  const id = response.body.backtestId as string
+  assert.equal(await runBacktest({ sql: db, logger: quietLogger() }, id), 'complete')
+
+  const result = await call(`/v1/backtests/${id}/result`, { token: 'alice' })
+  assert.equal(result.status, 200)
+  assert.ok(Array.isArray(result.body.equity), 'the equity curve must be served, not merely stored')
+  assert.ok(result.body.equity.length > 0, 'a completed run over a real series has a curve')
+  assert.ok(Array.isArray(result.body.fills), 'the fill list must be served')
+})
+
+test('an unfinished backtest is a state, not an empty result', { skip }, async () => {
+  // An empty fill list is a real answer — a strategy that never traded — so it must not be the
+  // same answer as "it has not run yet". This is the distinction 200-with-empty-arrays destroys.
+  const response = await call('/v1/backtests', {
+    method: 'POST',
+    token: 'alice',
+    body: { seriesId, strategyId: 'sma_cross', params: { fast: 5, slow: 20 }, startCash: '1000000', seed: 4 },
+  })
+  const pending = await call(`/v1/backtests/${response.body.backtestId}/result`, { token: 'alice' })
+  assert.equal(pending.status, 409)
+  assert.equal(pending.body.error.code, 'backtest_not_complete')
+  assert.match(pending.body.error.message, /queued/)
+})
+
+test("a result is scoped to its owner, in the query rather than after it", { skip }, async () => {
+  const response = await call('/v1/backtests', {
+    method: 'POST',
+    token: 'alice',
+    body: { seriesId, strategyId: 'sma_cross', params: { fast: 5, slow: 20 }, startCash: '1000000', seed: 5 },
+  })
+  await runBacktest({ sql: db, logger: quietLogger() }, response.body.backtestId)
+  const asBob = await call(`/v1/backtests/${response.body.backtestId}/result`, { token: 'bob' })
+  assert.equal(asBob.status, 404, "another user's backtest is absent, not forbidden")
+})
+
+test('the deployment reports whether live trading is switched on, without a token', { skip }, async () => {
+  // TRADE_LIVE_ENABLED defaults to false and nothing reported it, so a customer could configure a
+  // live bot and learn only when it refused to tick. Public, because it is a property of the
+  // deployment rather than of the caller.
+  const capabilities = await call('/v1/capabilities')
+  assert.equal(capabilities.status, 200)
+  assert.equal(typeof capabilities.body.capabilities.liveTrading.enabled, 'boolean')
+  if (!capabilities.body.capabilities.liveTrading.enabled) {
+    // The engine's own sentence, not a paraphrase that can drift from it.
+    assert.equal(capabilities.body.capabilities.liveTrading.refusal, LIVE_DISABLED)
+  }
 })
 
 test('two runs of one queued configuration agree, because the seed is stored with it', { skip }, async () => {
