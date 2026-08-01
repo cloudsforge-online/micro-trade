@@ -202,9 +202,23 @@ export function createRelay(deps: RelayDeps): Handler {
         await deliver(deps, clientFor, subscription, envelope, signature, deadlineMs)
       }
 
-      // Only when nothing is outstanding. A subscriber added after the event was written still
-      // receives it, because the delivery rows are computed from the live subscription set on
-      // every pass rather than fixed when the event was produced.
+      // Only when nothing is outstanding.
+      //
+      // THE GUARANTEE THIS USED TO CLAIM IS FALSE, and it was carried verbatim by eighteen
+      // repositories. It said "a subscriber added after the event was written still receives it",
+      // which holds only while some OTHER subscriber is still undelivered. With no active
+      // subscription for the topic — the ordinary case for a new event type — the count below is
+      // zero on the first pass, the row is published immediately, and it is never reconsidered. A
+      // subscriber added afterwards gets nothing.
+      //
+      // The behaviour is right: an outbox row that stays unpublished because nobody is listening
+      // is a backlog that grows for ever. It is the promise that was wrong, and a false guarantee
+      // is worse than none, because an integrator plans around it — "register the subscription
+      // whenever, the outbox will catch up" is a reasonable thing to believe from the old wording
+      // and will silently lose every event published before the subscription existed.
+      //
+      // Delivery rows ARE computed from the live subscription set on every pass, which is what
+      // makes a subscriber added mid-flight receive the remainder. That is the true half.
       const outstanding = await deps.sql<{ n: number }[]>`
         select count(*)::int as n
           from event_subscriptions s
