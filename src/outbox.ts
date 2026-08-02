@@ -17,7 +17,14 @@
  * measured conditions under which that stops being true.
  */
 
-import { EVENT_ID_HEADER, SIGNATURE_HEADER, signDelivery, verifyDelivery } from '@cloudsforge/contracts-events'
+import {
+  EVENT_ID_HEADER,
+  SIGNATURE_HEADER,
+  serviceActor,
+  signDelivery,
+  verifyDelivery,
+  type EventVersion,
+} from '@cloudsforge/contracts-events'
 import { createHmac, timingSafeEqual } from 'node:crypto'
 import type { Sql, TransactionSql } from 'postgres'
 import { HttpClient } from '@cloudsforge/http'
@@ -39,7 +46,6 @@ export interface DomainEvent {
   readonly version?: number
 }
 
-/** The wire envelope. Additive-only, versioned per topic, schema-diff enforced — AD-02. */
 /**
  * The wire version, in the CONTRACT's shape.
  *
@@ -48,18 +54,30 @@ export interface DomainEvent {
  * Every producer typed it `number` end to end and sent `1`, so even a delivery whose signature
  * verified was refused at the envelope. The stored column stays an integer — storage records the
  * major — and the mapping to the contract's shape happens here, at the wire, in one place.
+ *
+ * The return type is now the contract's own `EventVersion`, IMPORTED rather than restated. A local
+ * copy of a contract type is a copy that can drift, which is the whole reason this function exists.
  */
-const wireVersion = (v: number): `${number}.${number}` => `${v}.0` as `${number}.${number}`
+const wireVersion = (v: number): EventVersion => `${v}.0` as EventVersion
 
+/**
+ * The wire envelope. Additive-only, versioned per topic, schema-diff enforced — AD-02.
+ *
+ * **`actor` and `correlationId` are `string`, not `string | null`.** They used to be nullable here
+ * because the columns are nullable, and that was the same defect as the integer version wearing a
+ * third hat: `validateEnvelope` refuses a null actor ("actor: missing") and a null correlation id
+ * ("correlationId: missing; a cross-service investigation stops here"). A nullable column is a
+ * storage fact; the wire has no such freedom, and `buildEnvelope` is where the two meet.
+ */
 export interface EventEnvelope {
   readonly id: string
   readonly topic: string
   readonly key: string
   readonly occurredAt: string
   readonly producer: string
-  readonly version: `${number}.${number}`
-  readonly actor: string | null
-  readonly correlationId: string | null
+  readonly version: EventVersion
+  readonly actor: string
+  readonly correlationId: string
   readonly payload: Record<string, unknown>
 }
 
@@ -163,6 +181,38 @@ interface SubscriptionRow {
 }
 
 /**
+ * One outbox row → one wire envelope. **The only place an envelope is built.**
+ *
+ * Exported so `topics.test.ts` can hand the real thing to the contract's own `validateEnvelope`
+ * rather than to a copy. That distinction is the point: every service's suite was green while
+ * every event it emitted was refused, because both sides tested against imagined counterparts. A
+ * guard that builds its own envelope proves only that the guard can build an envelope.
+ *
+ * The two defaults are the contract's own semantics, not inventions:
+ *
+ *   - **`correlationId` falls back to the event id.** `makeEvent` does exactly this — "an event
+ *     that starts a story rather than continuing one is its own correlation root". A null here
+ *     would be refused outright, and refusing an event because nobody handed it a request id
+ *     would lose the event rather than the trace.
+ *   - **`actor` falls back to `service:trade`.** An emit with no actor was this service acting on
+ *     its own behalf — the bot tick, the fee settlement job — and that is precisely what
+ *     `serviceActor` spells. `null` is not an actor the contract has a word for.
+ */
+export function buildEnvelope(row: OutboxRow): EventEnvelope {
+  return {
+    id: row.id,
+    topic: row.topic,
+    key: row.key,
+    occurredAt: row.occurred_at.toISOString(),
+    producer: row.producer,
+    version: wireVersion(row.version),
+    actor: row.actor ?? serviceActor('trade'),
+    correlationId: row.correlation_id ?? row.id,
+    payload: row.payload,
+  }
+}
+
+/**
  * The relay job.
  *
  * A leased job rather than a `setInterval`, for the reason rule 8 exists: two replicas running an
@@ -203,17 +253,7 @@ export function createRelay(deps: RelayDeps): Handler {
         select id, url from event_subscriptions where topic = ${event.topic} and active = true
       `
 
-      const envelope: EventEnvelope = {
-        id: event.id,
-        topic: event.topic,
-        key: event.key,
-        occurredAt: event.occurred_at.toISOString(),
-        producer: event.producer,
-        version: wireVersion(event.version),
-        actor: event.actor,
-        correlationId: event.correlation_id,
-        payload: event.payload,
-      }
+      const envelope = buildEnvelope(event)
       // Signed over the exact bytes `HttpClient` will send: it stringifies the same object with
       // the same key order, so the MAC a subscriber recomputes over the received body matches.
       const signature = signEvent(JSON.stringify(envelope), deps.signingSecret)
