@@ -2,6 +2,8 @@
 
 Strategy catalogue, backtests, bots, fills, allocations, fee settlements and performance reporting.
 
+Design authority: [`ecosystem/03-repository-responsibilities.md`](https://github.com/cloudsforge-online/micro-docs/blob/main/ecosystem/03-repository-responsibilities.md)
+
 Derived from `crucible/services` — a **port and extend**, not a greenfield build. The trading engine
 in the frozen service is good and is carried forward largely intact; what is rewritten is everything
 around it that could not survive a second replica or a lost HTTP response.
@@ -213,3 +215,10 @@ Four defects in this repository's own first draft were found by these tests rath
 `bots_live_capital_reserved` constraint that made a stopped bot unable to release its user's capital,
 a live buy that overspent its own fee and drove `cash` negative, and a backtest route that returned a
 `bigint` straight to `JSON.stringify`. Each is noted at the line that fixes it.
+
+---
+
+## Provenance
+
+The code in this repository was written by **Claude Opus 5** and **Claude Fable 5**, under
+human direction and review.
