@@ -1,5 +1,7 @@
 # cloudsforge-trade
 
+[![ci](https://github.com/cloudsforge-online/micro-trade/actions/workflows/ci.yml/badge.svg)](https://github.com/cloudsforge-online/micro-trade/actions/workflows/ci.yml) [![TypeScript](https://img.shields.io/badge/TypeScript-strict%20ESM-3178C6?logo=typescript&logoColor=white)](./tsconfig.base.json) [![node](https://img.shields.io/badge/node-%3E%3D22-5FA04E?logo=nodedotjs&logoColor=white)](./package.json) [![tests](https://img.shields.io/badge/tests-real%20Postgres-4169E1?logo=postgresql&logoColor=white)](./.github/workflows/ci.yml)
+
 Strategy catalogue, backtests, bots, fills, allocations, fee settlements and performance reporting.
 
 Design authority: [`ecosystem/03-repository-responsibilities.md`](https://github.com/cloudsforge-online/micro-docs/blob/main/ecosystem/03-repository-responsibilities.md)
@@ -220,5 +222,5 @@ a live buy that overspent its own fee and drove `cash` negative, and a backtest 
 
 ## Provenance
 
-The code in this repository was written by **Claude Opus 5** and **Claude Fable 5**, under
-human direction and review.
+The code in this repository was written by **Claude Opus 5** and **Claude Fable 5**, assets
+generated with **FLUX 2 Pro**, under human direction and review.
