@@ -30,7 +30,7 @@
  *   2. **At test time, against the source rather than against this list.** `topics.test.ts` reads
  *      every topic literal out of `src/` and reconciles that set with the registry, and it builds
  *      a real envelope through the relay's own `buildEnvelope` and hands it to the contract's own
- *      `validateEnvelope`.
+ *      `classifyEnvelope`.
  *
  * ## Nothing this service emits is registered, and that is the thing to fix next
  *
@@ -43,10 +43,10 @@
  */
 
 import {
+  classifyEnvelope,
   isRegisteredTopic,
   isValidTopicName,
   topicsProducedBy,
-  validateEnvelope,
   type TopicName,
   type TopicSpec,
 } from '@cloudsforge/contracts-events'
@@ -194,28 +194,58 @@ export function malformedProposals(): readonly string[] {
 /**
  * Every reason a contract-following consumer would refuse this envelope.
  *
- * `validateEnvelope` is the contract's own function and is the exact check that `activity` and
+ * The check itself is `classifyEnvelope`, and it is the contract's — the exact check `activity` and
  * `notify` run on a delivered body. Running it here, on an envelope this service's relay actually
  * built, is the only way a producer finds out it is unreadable without waiting for two services to
- * be composed — which is how this was found the first time, months late.
+ * be composed, which is how this was found the first time, months late.
  *
- * **One error is tolerated and only one:** "not in this registry", and only for a topic the
- * quarantine above explains. That is a consumer being behind its producers, which is a normal
- * consequence of deploying twenty-two services independently and which `activity` handles by
- * quarantining rather than dropping. Every other error — a version in the wrong shape, a missing
- * correlation id, an id that is not a UUID, a producer that does not own its topic — is this
- * service emitting something nobody can read, and is returned.
+ * ## Why this is now four lines and not sixteen
+ *
+ * It used to make the "malformed" / "not in this registry" distinction itself, by comparing against
+ * the contract's exact error SENTENCE:
+ *
+ *     const excused = `topic: "${topic}" is not in this registry; contracts-events may be behind`
+ *     return verdict.errors.filter((error) => error !== excused)
+ *
+ * `market`, `community` and `devplatform` each carried that byte for byte. **A prose message is not
+ * an interface.** Reword it in `contracts-events` by one character and all four copies silently
+ * stop excusing anything: every quarantined topic starts reading as a producer bug and four suites
+ * go red for a reason unrelated to what they test. Nothing here tied the literal to its source.
+ * `classifyEnvelope` carries the distinction as STRUCTURE — `unregisteredTopic` is a field, not a
+ * sentence — so there is no longer a string that can drift.
+ *
+ * ## What this file still decides, and the contract cannot
+ *
+ * **Which** unregistered topics are excused: the ones `AWAITING_REGISTRATION` above proposes. A
+ * consumer lagging its producers is normal when twenty-two services deploy independently, and
+ * `activity` quarantines rather than drops. Everything else the contract found is returned — a
+ * version in the wrong shape, a missing correlation id, an id that is not a UUID, a producer that
+ * does not own its topic — because each of those is this service emitting the unreadable.
+ *
+ * ## Why not the contract's own `envelopeDefects(value, awaitingRegistration)`
+ *
+ * It ships beside `classifyEnvelope` and looks like a drop-in for this function. It is not, and the
+ * difference is the one this whole exercise is about. It flattens the verdict back to `string[]`,
+ * and in flattening it **drops `unregisteredTopic` whenever any other defect is present** — so an
+ * envelope on a topic nobody proposed that is ALSO malformed reports only the malformation, the
+ * author fixes it, re-runs, and only then learns about the topic. That contradicts the wrapper's
+ * own package documentation ("an envelope can be both, and `malformed` still reports
+ * `unregisteredTopic`, so a producer fixing it needs one round rather than two") and it is exactly
+ * the collapse of two facts into one that let eleven `notify` rules name topics no producer emits.
+ * `classifyEnvelope` itself is right; only the convenience wrapper loses the fact. So this reads the
+ * structured verdict and keeps both. Reported to `micro-contracts`; the test named "an unproposed
+ * topic AND a broken version are reported together" is what stops a future tidy-up from adopting
+ * the wrapper and losing a fact while every other assertion here stays green.
  */
 export function envelopeDefects(envelope: unknown): readonly string[] {
-  const verdict = validateEnvelope(envelope)
-  if (verdict.ok) return []
-  const topic =
-    typeof envelope === 'object' && envelope !== null
-      ? (envelope as Record<string, unknown>)['topic']
-      : undefined
-  const excused =
-    typeof topic === 'string' && Object.hasOwn(AWAITING_REGISTRATION, topic)
-      ? `topic: "${topic}" is not in this registry; contracts-events may be behind`
-      : null
-  return verdict.errors.filter((error) => error !== excused)
+  const verdict = classifyEnvelope(envelope)
+  // Reported FIRST, where `validateEnvelope` has always put it, so a reader of a failure sees the
+  // registry question before the envelope's own faults.
+  const unexplained =
+    verdict.unregisteredTopic !== null &&
+    !Object.hasOwn(AWAITING_REGISTRATION, verdict.unregisteredTopic)
+      ? [`topic: "${verdict.unregisteredTopic}" is not in the registry, and AWAITING_REGISTRATION does not propose it`]
+      : []
+  return [...unexplained, ...verdict.defects]
 }
+

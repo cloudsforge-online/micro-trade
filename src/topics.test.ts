@@ -13,7 +13,7 @@
  *      "version: missing". Every suite in the estate was green throughout, because both sides
  *      tested against imagined counterparts. The only check that could have caught it is the one
  *      below: build an envelope with the relay's own `buildEnvelope` and hand it to the contract's
- *      own `validateEnvelope`.
+ *      own `classifyEnvelope`.
  *
  * NOTE that the registry names no `trade.*` topic at all, so every topic here is quarantined and
  * the envelope check would pass vacuously if the quarantine excused everything. It does not: the
@@ -216,6 +216,36 @@ test('envelopeDefects excuses a lagging registry and nothing else', () => {
   assert.ok(
     envelopeDefects(broken).some((error) => error.startsWith('version:')),
     'an integer version must be reported however the topic is registered',
+  )
+})
+
+/**
+ * The case that separates this repository's `envelopeDefects` from the contract's own
+ * `envelopeDefects(value, awaitingRegistration)`, which ships beside `classifyEnvelope` and looks
+ * like a drop-in for it.
+ *
+ * "Malformed" and "not in this registry" are two facts with two remedies — a producer bug, and a
+ * missing registration — and an envelope can carry both. `classifyEnvelope` keeps both, deliberately
+ * (`unregisteredTopic` survives on a `malformed` verdict). The contract's flattening wrapper drops
+ * the topic whenever any other defect is present, so the author is sent to fix one thing twice.
+ *
+ * Every other assertion in this suite stays green under that wrapper. This is the only one that
+ * would go red, which is the point of writing it.
+ */
+test('an unproposed topic AND a broken version are reported together, not one per round', () => {
+  const both = {
+    ...buildEnvelope(ROW),
+    topic: 'trade.nothing.happened',
+    version: 1 as unknown as string,
+  }
+  const defects = envelopeDefects(both)
+  assert.ok(
+    defects.some((error) => error.startsWith('version:')),
+    `the producer bug must be named: ${defects.join('; ')}`,
+  )
+  assert.ok(
+    defects.some((error) => error.includes('trade.nothing.happened')),
+    `the missing registration must be named too: ${defects.join('; ')}`,
   )
 })
 
