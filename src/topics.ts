@@ -32,14 +32,25 @@
  *      a real envelope through the relay's own `buildEnvelope` and hands it to the contract's own
  *      `classifyEnvelope`.
  *
- * ## Nothing this service emits is registered, and that is the thing to fix next
+ * ## One of the five is now registered; the other four are still quarantined
  *
- * `trade` IS a valid `ProducerService` in the contract's union and owns **zero** topics in
- * `TOPICS`. Every one of the five below therefore sits in the quarantine, each carrying the exact
- * `TopicSpec` `micro-contracts` should paste. That is not a defect of this repository — the
- * contract package is not this one's to change — but it is the reason `activity` files every trade
- * event as `unclassified`: a bot a user started, a fill they were charged for, and a performance
- * fee taken from their account are all quarantined as events nobody has named.
+ * `trade` IS a valid `ProducerService` in the contract's union and, as of `micro-contracts`
+ * `8889373`, owns exactly one topic in `TOPICS`: **`trade.bot.paused`**, adopted verbatim from the
+ * entry that used to sit below. The other four still sit in the quarantine, each carrying the exact
+ * `TopicSpec` `micro-contracts` should paste.
+ *
+ * That is still the reason `activity` files most trade events as `unclassified` — a bot a user
+ * started, a fill they were charged for and a performance fee taken from their account are all
+ * events nobody has named. The two that matter most are `trade.fill.settled` and
+ * `trade.fee.settled`, because those are the two where money moves; `contracts/packages/events/
+ * src/audit.ts` says so in the `trade.bot.paused` entry and commits to auditing them when they land.
+ *
+ * The registration also changes what a mistake COSTS here. While every `trade.*` topic was
+ * unregistered, `activity` took its unregistered-topic branch and quarantined without validating,
+ * so an envelope defect on a trade event was invisible. `trade.bot.paused` is now validated on
+ * arrival like any registered topic, so a defect in the envelope carrying it is refused rather than
+ * shelved. `topics.test.ts` builds that envelope with this service's own relay and hands it to the
+ * contract's own `classifyEnvelope`, which is the check that closes the gap on this side.
  */
 
 import {
@@ -114,17 +125,11 @@ export const AWAITING_REGISTRATION: Readonly<Record<string, ProposedTopic>> = Ob
       description: 'A bot began trading and its allocation was reserved through the ledger.',
     },
   },
-  'trade.bot.paused': {
-    reason:
-      'The other half of started. Without it a consumer that saw a bot start believes it is still trading for ever.',
-    spec: {
-      producer: 'trade',
-      payloadType: 'BotPaused',
-      version: '1.0',
-      keyedBy: 'bot_id',
-      description: 'A bot stopped trading.',
-    },
-  },
+  // `trade.bot.paused` was here until contracts-events registered it (micro-contracts 8889373,
+  // adopted verbatim: `keyedBy: 'bot_id'`, `payloadType: 'BotPaused'`). Deleted rather than kept
+  // with a note, because `adoptedProposals()` fails while it is present and that failure IS the
+  // self-emptying quarantine. `bots.ts:614` still passes `bot.id` as the key, which is what the
+  // registered `keyedBy` names; `topics.test.ts` now pins that agreement from this side.
   'trade.fill.settled': {
     reason:
       'Keyed by FILL id, not bot id, and that difference is real: two fills for one bot have no ordering relationship to each other and pretending otherwise would serialise a bot behind its own history.',
@@ -162,8 +167,10 @@ export function undeclaredTopics(emitted: readonly string[]): readonly string[] 
  * Registry topics this service owns and never emits — a feature that can never fire.
  *
  * The direction that is easiest to miss, because nothing breaks and nothing logs: consumers
- * classify the topic, the code path renders it, and nothing ever arrives. Empty today only
- * because the registry owns no trade topic at all, which is the gap the quarantine describes.
+ * classify the topic, the code path renders it, and nothing ever arrives. It used to be empty
+ * vacuously — the registry owned no trade topic at all, so there was nothing for it to find. Since
+ * `trade.bot.paused` was registered it is a real check with one topic to answer for: delete or
+ * rename `bots.ts:614` and this returns it, naming a consumer that would wait for ever.
  */
 export function unemittedOwnedTopics(emitted: readonly string[]): readonly TopicName[] {
   const seen = new Set(emitted)

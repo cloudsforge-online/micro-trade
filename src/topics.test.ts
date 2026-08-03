@@ -15,9 +15,20 @@
  *      below: build an envelope with the relay's own `buildEnvelope` and hand it to the contract's
  *      own `classifyEnvelope`.
  *
- * NOTE that the registry names no `trade.*` topic at all, so every topic here is quarantined and
- * the envelope check would pass vacuously if the quarantine excused everything. It does not: the
- * last test below proves a real defect is still reported on a quarantined topic.
+ * NOTE that the registry names exactly ONE `trade.*` topic — `trade.bot.paused`, adopted by
+ * `micro-contracts` `8889373` — and the other four are still quarantined. So the envelope check
+ * would pass vacuously for four of five if the quarantine excused everything. It does not:
+ * `envelopeDefects excuses a lagging registry and nothing else` proves a real defect is still
+ * reported on a quarantined topic.
+ *
+ * The registered one carries a third obligation the other four do not, and it is the reason
+ * `the key trade.bot.paused is emitted with is the key the registry says it is` exists.
+ * `TopicSpec.keyedBy` is PROSE — a column name in a frozen object, not a type — so no compiler can
+ * make an emit site pass what it names. `custody` registered both ceremony topics `keyedBy:
+ * 'user_id'` while the emit sites passed the address, and `activity` reads the envelope key AS the
+ * subject id, so every export was filed against a user that does not exist while every name check
+ * in the estate stayed green. Registration is what makes that failure mode reachable here, so it
+ * is what the new test guards.
  *
  * No database. Pure text, set arithmetic and one function call, so it runs in CI even when the
  * database-backed suite skips.
@@ -30,6 +41,7 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
   SIGNATURE_HEADER,
+  TOPICS,
   TOPIC_NAMES,
   isRegisteredTopic,
   parseVersion,
@@ -139,11 +151,65 @@ test('a pending proposal disappears once contracts adopts it', () => {
     [],
     'the registry now names these — delete them from AWAITING_REGISTRATION',
   )
-  // The gap this quarantine describes: trade is a ProducerService that owns no registered topic,
-  // so every trade event reaches activity as `unclassified`. Asserted rather than assumed, so the
-  // day contracts adopts one this file is what says so.
-  assert.equal(topicsProducedBy(SERVICE).length, 0)
-  assert.equal(Object.keys(AWAITING_REGISTRATION).length, EMITTED_TOPICS.length)
+  // Every emitted topic is accounted for EXACTLY once — registered or quarantined, never both and
+  // never neither. This replaces two counts (`topicsProducedBy(SERVICE).length === 0` and
+  // `AWAITING_REGISTRATION.length === EMITTED_TOPICS.length`) that were true only while the
+  // registry owned no trade topic, and that a reader could have restored to green by adjusting a
+  // number. A partition cannot be satisfied by editing one side.
+  assert.deepEqual(
+    [...topicsProducedBy(SERVICE), ...Object.keys(AWAITING_REGISTRATION)].sort(),
+    [...EMITTED_TOPICS].sort(),
+    'an emitted topic is registered or quarantined — this says it is neither, or counted twice',
+  )
+  // And the split itself, pinned, so moving a topic across the line is a deliberate edit here.
+  // `trade.bot.paused` is the one contracts has adopted (micro-contracts 8889373); the four that
+  // remain include `trade.fill.settled` and `trade.fee.settled`, which are the two where money
+  // moves and the two `contracts/packages/events/src/audit.ts` commits to auditing when they land.
+  assert.deepEqual(topicsProducedBy(SERVICE), ['trade.bot.paused'])
+  assert.deepEqual(Object.keys(AWAITING_REGISTRATION).sort(), [
+    'trade.bot.created',
+    'trade.bot.started',
+    'trade.fee.settled',
+    'trade.fill.settled',
+  ])
+})
+
+/**
+ * The `custody` defect, asked from this side of the wire.
+ *
+ * `keyedBy` is prose in the registry — a column name, not a type — so nothing in the contract can
+ * force an emit site to pass what it names. Both of custody's ceremony topics were registered
+ * `keyedBy: 'user_id'` while the emit sites passed the ADDRESS, and `activity` reads the envelope
+ * key AS the subject id, so every export was filed against a user that does not exist. Every name
+ * check in the estate passed throughout, because every name was right.
+ *
+ * `micro-contracts` checked this once, by reading `bots.ts:614` while adopting the spec. That is a
+ * check with no expiry date attached: it cannot notice the emit site changing afterwards. This is
+ * the standing version — it reads the real emit site out of `src/` and matches it against the
+ * registered `keyedBy`, so moving the key to (say) `bot.userId` goes red here rather than silently
+ * refiling every pause event against the wrong aggregate.
+ */
+test('the key trade.bot.paused is emitted with is the key the registry says it is', () => {
+  const spec = TOPICS['trade.bot.paused']
+  assert.equal(spec.keyedBy, 'bot_id', 'the registered ordering key changed under this emit site')
+
+  const bots = readFileSync(join(SRC, 'bots.ts'), 'utf8')
+  const emits = bots
+    .split('\n')
+    .map((line, index) => ({ line, at: `bots.ts:${index + 1}` }))
+    .filter(({ line }) => line.includes("topic: 'trade.bot.paused'"))
+  // If the emit moves or is duplicated, this is what notices — a second emit site is how one topic
+  // acquires two payload shapes, which is the thing that made `identity.mfa.changed`
+  // unregisterable by construction.
+  assert.equal(emits.length, 1, 'trade.bot.paused should have exactly one emit site')
+
+  // `bot_id` means `bot.id`, and nothing else. `bot.userId` is the other id in scope at that line
+  // and is exactly the substitution custody made.
+  assert.match(
+    emits[0]!.line,
+    /key: bot\.id\b/,
+    `${emits[0]!.at} passes something other than bot.id as the key, while the registry says bot_id`,
+  )
 })
 
 test('every pending proposal carries a spec that could be pasted into the registry', () => {
@@ -270,10 +336,50 @@ test('the delivery this relay signs is one a contract-following consumer verifie
  * by dead code while identity's own guard passes, because it scans literals rather than
  * reachability. This is the cheapest check that catches that exact shape.
  *
- * The detector is exercised on a fixture FIRST. A repository with no exported emitter would
- * otherwise get a green from a scan that finds nothing because it is broken, which is precisely
- * the "check that cannot fail" this estate keeps rediscovering.
+ * ## An import is not a call, and this used to think it was
+ *
+ * The scan below asks whether any line in `src/` mentions the symbol. An `import { emitFoo } from
+ * './foo.ts'` line mentions it, so a symbol that was imported and then never called read as
+ * reached. That is not hypothetical: deleting BOTH `emitKeyRevoked` call sites from `server.ts` and
+ * leaving its import left `micro-devplatform`'s suite fully green, with
+ * `devplatform.key.revoked` — the topic `11-data-and-contract-strategy.md:363` names as the
+ * estate's key-cache flush — produced by nothing at all. The identical detector was here. The check could not fail in exactly the case it was written for, because the
+ * import that survives a deleted call is the FIRST thing a reader would delete last.
+ *
+ * This is the same family as the defect it was written to catch: a scan that counts a MENTION as a
+ * USE. So imports and re-exports are stripped before the reference scan. Blank lines are left in
+ * their place, so line numbers in the declaration scan still name the real line.
+ *
+ * The detector is exercised on fixtures FIRST, including that exact case. A repository with no
+ * exported emitter would otherwise get a green from a scan that finds nothing because it is broken,
+ * which is precisely the "check that cannot fail" this estate keeps rediscovering — and it is not
+ * hypothetical here either: THIS repository declares no exported emitter at all, so the
+ * fixtures below are the ONLY thing exercising this code here.
  */
+function withoutImports(text: string): string {
+  const kept: string[] = []
+  let inDeclaration = false
+  for (const line of text.split('\n')) {
+    const trimmed = line.trimStart()
+    // `export { x } from './y.ts'` re-exports a symbol without using it, exactly as an import does.
+    const opens = !inDeclaration && /^(?:import\b|export\s*\{[^}]*$|export\s*\{[^}]*\}\s*from\b)/.test(trimmed)
+    if (opens) {
+      // A bare `import './x.ts'` and a one-line `import { a } from './x.ts'` both close at once; a
+      // braced list spread over several lines closes at the `from '…'`.
+      inDeclaration = !/\bfrom\s+['"]/.test(line) && !/^import\s+['"]/.test(trimmed)
+      kept.push('')
+      continue
+    }
+    if (inDeclaration) {
+      if (/\bfrom\s+['"]/.test(line)) inDeclaration = false
+      kept.push('')
+      continue
+    }
+    kept.push(line)
+  }
+  return kept.join('\n')
+}
+
 function unreachedEmitters(files: readonly { name: string; text: string }[]): readonly string[] {
   const declared: { symbol: string; where: string }[] = []
   for (const file of files) {
@@ -282,10 +388,11 @@ function unreachedEmitters(files: readonly { name: string; text: string }[]): re
       if (match?.[1]) declared.push({ symbol: match[1], where: `${file.name}:${index + 1}` })
     })
   }
+  const bodies = files.map((file) => ({ name: file.name, text: withoutImports(file.text) }))
   return declared
     .filter(({ symbol }) => {
       const reference = new RegExp(`\\b${symbol}\\b`)
-      for (const file of files) {
+      for (const file of bodies) {
         for (const line of file.text.split('\n')) {
           const trimmed = line.trimStart()
           if (trimmed.startsWith('*') || trimmed.startsWith('//') || trimmed.startsWith('/*')) continue
@@ -310,6 +417,51 @@ test('the unreachable-emitter detector can actually fail', () => {
     { name: 'server.ts', text: 'emitSessionRevoked()\n' },
   ]
   assert.deepEqual(unreachedEmitters(alive), [])
+})
+
+/**
+ * The case the detector used to get wrong, and the reason it is worth having at all.
+ *
+ * A dead emitter is almost never dead by having its import removed too — a call is deleted or
+ * refactored away and the import is what lingers. Counting that import as a reference made this
+ * check green in precisely the situation it exists for.
+ */
+test('an emitter that is imported but never called is NOT reached', () => {
+  const importedOnly = [
+    { name: 'apikeys.ts', text: 'export function emitKeyRevoked(): void {}\n' },
+    {
+      name: 'server.ts',
+      text: "import { emitKeyRevoked, revokeApiKey } from './apikeys.ts'\nrevokeApiKey()\n",
+    },
+  ]
+  assert.deepEqual(unreachedEmitters(importedOnly), ['emitKeyRevoked (apikeys.ts:1)'])
+
+  // The multi-line form, which is how every import in this service is actually written.
+  const multiline = [
+    { name: 'apikeys.ts', text: 'export function emitKeyRevoked(): void {}\n' },
+    {
+      name: 'server.ts',
+      text: "import {\n  emitKeyRevoked,\n  revokeApiKey,\n} from './apikeys.ts'\nrevokeApiKey()\n",
+    },
+  ]
+  assert.deepEqual(unreachedEmitters(multiline), ['emitKeyRevoked (apikeys.ts:1)'])
+
+  // A re-export is not a use either.
+  const reExported = [
+    { name: 'apikeys.ts', text: 'export function emitKeyRevoked(): void {}\n' },
+    { name: 'index.ts', text: "export { emitKeyRevoked } from './apikeys.ts'\n" },
+  ]
+  assert.deepEqual(unreachedEmitters(reExported), ['emitKeyRevoked (apikeys.ts:1)'])
+
+  // And stripping imports must not blind it to the call that FOLLOWS one.
+  const importedAndCalled = [
+    { name: 'apikeys.ts', text: 'export function emitKeyRevoked(): void {}\n' },
+    {
+      name: 'server.ts',
+      text: "import {\n  emitKeyRevoked,\n} from './apikeys.ts'\nemitKeyRevoked()\n",
+    },
+  ]
+  assert.deepEqual(unreachedEmitters(importedAndCalled), [])
 })
 
 test('every exported emitter is reached from somewhere', () => {
