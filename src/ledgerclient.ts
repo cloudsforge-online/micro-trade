@@ -43,8 +43,28 @@
 import { HttpClient, HttpError } from '@cloudsforge/http'
 import type { AssetCode } from '@cloudsforge/contracts-chain'
 import type { Actor, EntryKind, LedgerAssetCode } from '@cloudsforge/contracts-money'
+import type { LiveScope } from '@cloudsforge/contracts-auth'
 
-export const LEDGER_SCOPES: readonly string[] = Object.freeze([
+/**
+ * The scopes this service's token must carry to call the ledger.
+ *
+ * `readonly LiveScope[]`, not `readonly string[]`. This is an OUTBOUND demand — what trade
+ * presents to the ledger — and that direction had never been checked by anything.
+ * `service-ci.yml`'s scope audit reads a repository's INBOUND route gates, which is how two
+ * services in this estate came to declare scopes that do not exist (`policy:evaluate`,
+ * `custody:address`) with nothing noticing. `micro-deploy`'s `derive-grants.mjs` reads this
+ * constant into `IDENTITY_SERVICE_TOKEN_GRANTS`, and identity validates that list against the
+ * registry at import and REFUSES TO BOOT on an unknown name — so a typo here is not one failed
+ * ledger call, it is no token minting for the whole estate.
+ *
+ * `LiveScope` rather than `Scope` because `Scope` is `keyof typeof SCOPES` — every registered key,
+ * DEPRECATED ones included — and identity will not mint a deprecated scope either. `LiveScope =
+ * Exclude<Scope, DeprecatedScope>`, with `DeprecatedScope` computed FROM `SCOPES` by a conditional
+ * type over the `deprecated` field rather than hand-listed, so it cannot drift from the registry
+ * (`contracts/packages/auth/src/index.ts:507`). Reading a token stays wide — one may arrive
+ * carrying a scope that has since died — and demanding is narrow. This is demanding.
+ */
+export const LEDGER_SCOPES: readonly LiveScope[] = Object.freeze([
   'ledger:post',
   'ledger:reserve',
   // Read is here for exactly one caller: `collect` in src/fees.ts, which must ask what a wallet

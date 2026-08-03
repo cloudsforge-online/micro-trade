@@ -39,9 +39,32 @@
 
 import { HttpClient, HttpError } from '@cloudsforge/http'
 import { RATE_SCALE, type AssetCode } from '@cloudsforge/contracts-chain'
+import type { LiveScope } from '@cloudsforge/contracts-auth'
 import type { Clock } from './rng.ts'
 
-export const PRICING_SCOPES: readonly string[] = Object.freeze(['pricing:read'])
+/**
+ * The scopes this service's token must carry to call pricing.
+ *
+ * `readonly LiveScope[]` rather than `readonly string[]`: see the header of `ledgerclient.ts`.
+ * This is an outbound demand, `derive-grants.mjs` reads it into the grant list, and identity
+ * refuses to boot on a name the registry does not have or has deprecated.
+ *
+ * ── AND THIS GRANT IS WIDER THAN THE CALL SITE NEEDS ─────────────────────────────────────────
+ *
+ * `pricing:read` is registered and pricing enforces it, but the ONE route this client calls,
+ * `GET /rates` (`pricing/src/server.ts:312`), is not gated at all — the board is public. So the
+ * honest declaration is "nothing", and it is not written here yet for a reason belonging to the
+ * derivation rather than to this service: `derive-grants.mjs` treats a module that presents a
+ * credential and declares no scope as an undeclared gap and fails the estate build.
+ * `@cloudsforge/contracts-auth` now exports `NO_SCOPES_REQUIRED` to make "nothing" a statement
+ * rather than an absence, but the reader has not caught up — `derive-grants.mjs` matches
+ * `= Object.freeze(` and would see `= NO_SCOPES_REQUIRED` as no declaration at all. Switching
+ * this line today fails the estate build. micro-deploy first, then this. Narrow it once that
+ * branch lands: an over-declaration is a real grant on a real token, and AD-05 says a token
+ * carries the least it can. `micro-wallet`'s `PRICING_SCOPES` is the same line waiting on the
+ * same change.
+ */
+export const PRICING_SCOPES: readonly LiveScope[] = Object.freeze(['pricing:read'])
 
 /**
  * How old a quote may be before this service refuses to trade on it.
