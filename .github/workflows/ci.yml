@@ -182,3 +182,37 @@ jobs:
     uses: cloudsforge-online/micro-org/.github/workflows/secret-hygiene.yml@main
     permissions:
       contents: read
+
+  # ──────────────────────────────────────────────────────────────────────────────────────────────
+  # THE IMAGE, PUBLISHED. `cfctl release` writes a manifest naming ghcr.io/cloudsforge-online/<repo>
+  # at this repository's package.json version (micro-org tools/cfctl.ts:889-934, image name derived
+  # at tools/registry.ts:367-369); `cfctl release --verify` runs `docker manifest inspect` on every
+  # entry (cfctl.ts:937-975); and deploy/scripts/release-deploy.sh:99-125 refuses to change anything
+  # until all of them pull. Until this job existed CI built this image and threw it away, so that
+  # gate rejected every service in the estate and the manifest path could not be used at all.
+  #
+  # `packages: write` IS GRANTED HERE rather than asked for inside the shared CI workflow, and that
+  # is forced rather than stylistic: a called workflow's GITHUB_TOKEN can only be maintained or
+  # reduced, never elevated, so a reusable workflow asking for a permission its caller withheld
+  # fails the whole run at STARTUP — before a step runs, on pull requests as well as on main.
+  # Measured on micro-org: run 30900277471 (caller capped at `packages: read`) ended in
+  # startup_failure; run 30900280323 (same workflow, caller granted `packages: write`) succeeded.
+  # That is also why `push: false` is correct and stays in the shared workflow's image job — that
+  # job is a GATE and needs `load:` so it can boot the image and read its health endpoint. This is
+  # the producer. Different purposes, so different jobs.
+  # ──────────────────────────────────────────────────────────────────────────────────────────────
+  publish:
+    needs: [estate, migrate, rules, hygiene]
+    # A green push to main and nothing else. An image tag a release manifest pins has to name
+    # something that passed, on the branch it will be deployed from.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    uses: cloudsforge-online/micro-org/.github/workflows/publish-image.yml@main
+    with:
+      kind: service
+    secrets:
+      # The same sibling checkouts the Dockerfile's named build contexts need: the image cannot be
+      # built without micro-runtime and micro-contracts beside it.
+      estate_token: ${{ secrets.ESTATE_READ_TOKEN }}
+    permissions:
+      contents: read
+      packages: write
