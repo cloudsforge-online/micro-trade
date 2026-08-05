@@ -95,6 +95,41 @@ function boolean(source: Source, name: string, fallback: boolean): boolean {
   throw new EnvError(`${name} must be true or false (got ${raw})`)
 }
 
+/**
+ * The secrets the inbound event route accepts, newest first.
+ *
+ * A LIST, not a value, because rotating `OUTBOX_SIGNING_SECRET` without an overlap window would
+ * require every producer in the estate to change secret in the same instant this service does, and
+ * that instant does not exist during a rolling deploy. A producer that moved first would simply be
+ * refused — and the topic this service consumes on that hop is `identity.user.deleted`, so a silent
+ * partition is an erasure obligation quietly not met.
+ *
+ * Copied from `devplatform/src/env.ts:103`, which took the shape from activity's
+ * `ACTIVITY_INGEST_SECRETS`. Each entry is validated exactly as a single secret is: a list is not a
+ * way to smuggle in a value that `requiredSecret` would refuse on its own.
+ */
+export function parseSecretList(raw: string, name: string): readonly string[] {
+  const entries = raw
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0)
+  if (entries.length === 0) throw new EnvError(`${name} is required — at least one secret`)
+  for (const entry of entries) {
+    if (PLACEHOLDERS.has(entry.toLowerCase())) {
+      throw new EnvError(`${name} contains a known placeholder — generate real secrets`)
+    }
+    if (entry.length < 24) {
+      throw new EnvError(`${name} entries must each be at least 24 characters`)
+    }
+  }
+  if (new Set(entries).size !== entries.length) {
+    // A duplicated secret makes the "which key verified this" answer ambiguous, and that answer is
+    // what tells an operator whether a rotation has finished and the old key can be dropped.
+    throw new EnvError(`${name} lists the same secret twice`)
+  }
+  return Object.freeze(entries)
+}
+
 export interface Env {
   readonly port: number
   readonly env: string
@@ -108,8 +143,20 @@ export interface Env {
   readonly databasePoolMax: number
   readonly identityJwksUrl: string
   readonly identityIssuer: string
-  /** HMAC key for outbound event signatures, so a subscriber can prove an event came from us. */
+  /**
+   * HMAC key for outbound event signatures, so a subscriber can prove an event came from us.
+   * Exactly one, always: a producer signing under two keys at once has not rotated, it has forked.
+   */
   readonly outboxSigningSecret: string
+  /**
+   * The secrets `POST /v1/events` will ACCEPT, newest first.
+   *
+   * Defaults to `[outboxSigningSecret]` when `OUTBOX_ACCEPT_SECRETS` is unset, so a deploy that
+   * does not set it behaves exactly as it does today. That is deliberate: it makes shipping this
+   * change a no-op, which is what lets the estate's shared secret be rotated one service at a time
+   * afterwards rather than on a flag day.
+   */
+  readonly acceptSecrets: readonly string[]
   /** Hard upstream — every fill posting, every fee, every capital reservation. 07 §2. */
   readonly ledgerUrl: string
   /** Hard upstream — "a bot with no price does not trade". 07 §2. */
@@ -162,6 +209,8 @@ export function loadEnv(source: Source = process.env, host = ''): Env {
   if (!LEVELS.has(logLevel)) {
     throw new EnvError(`LOG_LEVEL must be one of debug, info, warn, error (got ${logLevel})`)
   }
+  // Read before the object literal because the accept list falls back to it.
+  const outboxSigningSecret = requiredSecret(source, 'OUTBOX_SIGNING_SECRET')
   return {
     port: integer(source, 'PORT', 4000, 1, 65_535),
     env: optional(source, 'NODE_ENV', 'development'),
@@ -173,7 +222,11 @@ export function loadEnv(source: Source = process.env, host = ''): Env {
     databasePoolMax: integer(source, 'TRADE_DATABASE_POOL_MAX', 10, 1, 100),
     identityJwksUrl: required(source, 'IDENTITY_JWKS_URL'),
     identityIssuer: required(source, 'IDENTITY_ISSUER'),
-    outboxSigningSecret: requiredSecret(source, 'OUTBOX_SIGNING_SECRET'),
+    outboxSigningSecret,
+    acceptSecrets: parseSecretList(
+      optional(source, 'OUTBOX_ACCEPT_SECRETS', outboxSigningSecret),
+      'OUTBOX_ACCEPT_SECRETS',
+    ),
     ledgerUrl: required(source, 'LEDGER_URL'),
     pricingUrl: required(source, 'PRICING_URL'),
     billingUrl: required(source, 'BILLING_URL'),

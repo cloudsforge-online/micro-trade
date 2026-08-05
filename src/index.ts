@@ -156,7 +156,10 @@ const server = createServer({
   clock: systemClock,
   liveEnabled: env.liveEnabled,
   settlementPeriodSeconds: env.settlementPeriodSeconds,
-  eventSigningSecret: env.outboxSigningSecret,
+  // Signing stays singular (the relay below); ACCEPTING is a list, so the estate's shared secret
+  // can be rotated with an overlap window instead of a flag day. Unset, this is exactly
+  // `[OUTBOX_SIGNING_SECRET]`, which is today's behaviour byte for byte.
+  eventAcceptSecrets: env.acceptSecrets,
   // Queue depth is sampled at scrape time rather than on a timer. There is no `setInterval` in this
   // repository, and CI greps for one — rule 8.
   beforeScrape: async () => {

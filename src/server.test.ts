@@ -52,6 +52,15 @@ let clock: TestClock
 let enqueued: Array<{ kind: string; key: string }>
 let seriesId: string
 
+/**
+ * The inbound accept list, read through a getter below so a test can restage a rotation without
+ * rebuilding the server. `beforeEach` puts it back to the single-secret default.
+ */
+let acceptSecrets: readonly string[] = [EVENT_SECRET]
+
+/** The secret a rotation moves TO. Obviously fake, and long enough to clear the 24-char rule. */
+const ROTATED_SECRET = 'a-rotated-looking-secret-of-sufficient-length'
+
 const BAR_WIDTH = 3_600
 const BARS = makeBars({ count: 200, shape: 'sawtooth', widthSeconds: BAR_WIDTH })
 const NEWEST = BARS[BARS.length - 1] as (typeof BARS)[number]
@@ -97,7 +106,9 @@ before(async () => {
     },
     liveEnabled: true,
     settlementPeriodSeconds: 3_600,
-    eventSigningSecret: EVENT_SECRET,
+    get eventAcceptSecrets() {
+      return acceptSecrets
+    },
   } as never)
 
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()))
@@ -114,6 +125,7 @@ beforeEach(async () => {
   pricing.set('BTC', 30_000n * RATE_SCALE)
   clock = testClock(FRESH_MS)
   enqueued = []
+  acceptSecrets = [EVENT_SECRET]
   seriesId = await seedSeries(db, BARS)
 })
 
@@ -592,6 +604,40 @@ const deletedEnvelope = (id = '33333333-3333-4333-8333-333333333333', userId = A
 
 test('an event with no valid signature is refused before its body is parsed', { skip }, async () => {
   const response = await postEvent(deletedEnvelope(), 'sha256=deadbeef')
+  assert.equal(response.status, 403)
+  assert.equal(response.body.error.code, 'bad_signature')
+})
+
+/**
+ * **THE PROPERTY A ROLLING ROTATION DEPENDS ON.**
+ *
+ * `OUTBOX_SIGNING_SECRET` is one key shared across the estate. Rotating it means producers and
+ * receivers change over a window, and during that window some producers are still signing with the
+ * old key. If this route accepted only the new one their deliveries would 403 — and the topic this
+ * route consumes is `identity.user.deleted`, so a silent partition is an erasure obligation quietly
+ * not met, on a service that stores `user_id`.
+ *
+ * So: the NEW secret leads the accept list, the delivery is signed with the SUPERSEDED one, and it
+ * must still be acted on.
+ */
+test('AN EVENT SIGNED WITH THE SUPERSEDED SECRET IS STILL ACCEPTED WHILE THE NEW ONE LEADS', { skip }, async () => {
+  const botId = await createBot()
+  acceptSecrets = [ROTATED_SECRET, EVENT_SECRET]
+  const body = JSON.stringify(deletedEnvelope())
+  // Signed with the OLD key — what a producer that has not been redeployed yet sends.
+  const response = await postEvent(deletedEnvelope(), signEvent(body, EVENT_SECRET))
+  assert.equal(response.status, 202, 'a producer still on the superseded secret must not be partitioned off')
+  assert.equal(response.body.status, 'recorded')
+  const rows = await sql<{ id: string }[]>`select id from bots where id = ${botId}`
+  assert.equal(rows.length, 0, 'the erasure must actually have run, not merely been acknowledged')
+})
+
+test('A SECRET THAT IS NOT ON THE ACCEPT LIST IS STILL REFUSED', { skip }, async () => {
+  // The other direction. Accepting a list must not become accepting anything: dropping the old
+  // secret from the list is what finishes a rotation, and it has to actually stop those deliveries.
+  acceptSecrets = [ROTATED_SECRET]
+  const body = JSON.stringify(deletedEnvelope())
+  const response = await postEvent(deletedEnvelope(), signEvent(body, EVENT_SECRET))
   assert.equal(response.status, 403)
   assert.equal(response.body.error.code, 'bad_signature')
 })

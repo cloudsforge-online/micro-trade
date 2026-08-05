@@ -48,7 +48,7 @@ import {
   topicsProducedBy,
   verifyDelivery,
 } from '@cloudsforge/contracts-events'
-import { buildEnvelope, signEvent } from './outbox.ts'
+import { buildEnvelope, signEvent, verifyEventSignature } from './outbox.ts'
 import {
   AWAITING_REGISTRATION,
   EMITTED_TOPICS,
@@ -324,6 +324,26 @@ test('the delivery this relay signs is one a contract-following consumer verifie
   assert.equal(SIGNATURE_HEADER, 'cf-signature')
   const verification = verifyDelivery(body, signEvent(body, secret), [secret])
   assert.equal(verification.ok, true)
+})
+
+/**
+ * The verifier takes a LIST, and the list is not looped over here.
+ *
+ * `verifyEventSignature` passes the candidates straight into the contract's `verifyDelivery`, which
+ * is where the timing-safe comparison and the freshness window live. Looping in this service would
+ * mean re-deriving both, and a byte-at-a-time comparison of a MAC is a forgery oracle.
+ */
+test('a delivery signed with a superseded secret verifies while the new secret leads the list', () => {
+  const body = JSON.stringify(buildEnvelope(ROW))
+  // Obviously fake, and long enough to clear the 24-character rule the env applies to each entry.
+  const superseded = 'superseded-secret-0000000000000000'
+  const rotated = 'rotated-secret-00000000000000000000'
+  // The exact shape a rolling rotation depends on: newest first, signed with the old one.
+  assert.equal(verifyEventSignature(body, [rotated, superseded], signEvent(body, superseded)), true)
+  // And the scalar form still works, because nothing that passes one secret had to change.
+  assert.equal(verifyEventSignature(body, superseded, signEvent(body, superseded)), true)
+  // Dropping the old secret from the list is what finishes the rotation, so it must actually stop.
+  assert.equal(verifyEventSignature(body, [rotated], signEvent(body, superseded)), false)
 })
 
 /* ------------------------------------------------------------------ reachability */

@@ -146,9 +146,21 @@ export function signEvent(body: string, secret: string): string {
   return signDelivery(body, secret)
 }
 
-/** Timing-safety and the freshness window both live in the contract's verifier. */
-export function verifyEventSignature(body: string, secret: string, presented: string): boolean {
-  return verifyDelivery(body, presented, secret).ok
+/**
+ * Timing-safety and the freshness window both live in the contract's verifier.
+ *
+ * `secrets` may be a LIST, and the candidates are handed straight to `verifyDelivery` rather than
+ * looped over here. That is the point: the contract tries each with `timingSafeEqual`, and a
+ * byte-at-a-time comparison of a MAC is a byte-at-a-time forgery oracle. Looping in this file would
+ * also re-derive the freshness window per candidate. A list is what gives a rotation of the
+ * estate's shared signing secret an overlap window instead of a flag day.
+ */
+export function verifyEventSignature(
+  body: string,
+  secrets: string | readonly string[],
+  presented: string,
+): boolean {
+  return verifyDelivery(body, presented, secrets).ok
 }
 
 /* ------------------------------------------------------------------------ relay */

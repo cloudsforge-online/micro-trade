@@ -94,8 +94,15 @@ export interface ServerDeps {
   readonly clock: Clock
   readonly liveEnabled: boolean
   readonly settlementPeriodSeconds: number
-  /** Verifies inbound event signatures. */
-  readonly eventSigningSecret: string
+  /**
+   * The secrets inbound event signatures are verified against, newest first.
+   *
+   * A list rather than a value so that rotating the estate's shared `OUTBOX_SIGNING_SECRET` has an
+   * overlap window: a producer that has not been redeployed yet is still signing with the old key,
+   * and refusing it would silently partition `identity.user.deleted` off this service. Signing is
+   * unaffected — the relay keeps its single `signingSecret`.
+   */
+  readonly eventAcceptSecrets: readonly string[]
   readonly beforeScrape?: () => Promise<void>
 }
 
@@ -719,7 +726,7 @@ function buildRoutes(): Route[] {
     define('POST', '/v1/events', async (ctx, deps) => {
       const raw = await readRaw(ctx.req)
       const presented = headerOf(ctx.req, SIGNATURE_HEADER)
-      if (!presented || !verifyEventSignature(raw, deps.eventSigningSecret, presented)) {
+      if (!presented || !verifyEventSignature(raw, deps.eventAcceptSecrets, presented)) {
         // Not 401: this is not a bearer-token surface, and answering 401 would invite a caller to go
         // and find a token. The MAC is the credential.
         return errorReply(403, 'bad_signature', 'the event signature did not verify', ctx.requestId)

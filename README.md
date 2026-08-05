@@ -163,6 +163,28 @@ five services on placeholders that could not be mistaken for credentials — whi
 
 ---
 
+## Rotating the shared event-signing secret
+
+`OUTBOX_SIGNING_SECRET` is one key held by 24 services, and its current value is a placeholder
+committed to a public file, so it has to be rotated. It signs the outbox→inbox hop, so if a producer
+moves to a new key while this receiver still holds only the old one, delivery partitions **silently**
+— and the topic this service consumes on that hop is `identity.user.deleted`, which means a
+partition is an erasure obligation quietly not met on a service that stores `user_id`.
+
+A rolling rotation is only possible if the **receiver** accepts more than one key at once, so it
+takes a list:
+
+| Variable | Required | What it does |
+|---|---|---|
+| `OUTBOX_SIGNING_SECRET` | yes | The single key this service **signs** its own outbox deliveries with. Never a list: a producer signing under two keys has not rotated, it has forked. |
+| `OUTBOX_ACCEPT_SECRETS` | no | Comma-separated, **newest first**. The keys `POST /v1/events` will **accept**. Unset, it is exactly `[OUTBOX_SIGNING_SECRET]`, which is today's behaviour byte for byte — so deploying this is a no-op, and that is what lets the rotation be staged one service at a time. Each entry is validated like the signing secret (no known placeholder, at least 24 characters), and a repeated entry is refused at boot. |
+
+The candidates are handed straight to `contracts-events`' `verifyDelivery`, never looped over here:
+that is where the `timingSafeEqual` comparison and the freshness window live, and a byte-at-a-time
+comparison of a MAC is a byte-at-a-time forgery oracle. The duplicate rule matters for the same
+reason the list does — `verifyDelivery` reports **which** key matched, and that index is the only
+signal that says every producer has moved off the old key and it can be dropped.
+
 ## Layout
 
 ```
