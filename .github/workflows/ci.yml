@@ -40,12 +40,21 @@ jobs:
       port: 4000
       # The image startup smoke test boots the real service, and `env.ts` validates its
       # configuration at import — so the container needs every variable it declares, not just a
-      # database, or it exits before it serves /livez. CI-only NON-secrets: throwaway tokens that
-      # clear a length check, URLs that are never dialled because /livez needs no upstream.
+      # database, or it exits before it serves /livez. The URLs are never dialled because /livez
+      # needs no upstream, and TRADE_SERVICE_TOKEN is still a throwaway that only has to clear a
+      # length check.
+      #
+      # OUTBOX_SIGNING_SECRET IS NO LONGER ONE OF THOSE. It is now checked by @cloudsforge/secrets,
+      # which asserts the SHAPE of a generated value and has no CI exemption, so
+      # `ci-only-not-a-real-secret-…` is refused here exactly as it would be in production
+      # (micro-org #142). `@generate` asks service-ci.yml for a fresh `openssl rand -base64 48` per
+      # run: CI does not need a WEAK secret, it needs A secret, and nothing in this smoke test
+      # verifies a signature against anything else. Generated rather than committed, so this
+      # repository never holds a string that looks like a key.
       smoke-env: |
         IDENTITY_JWKS_URL=http://127.0.0.1:4001/.well-known/jwks.json
         IDENTITY_ISSUER=http://127.0.0.1:4001
-        OUTBOX_SIGNING_SECRET=ci-only-not-a-real-secret-000000000000
+        OUTBOX_SIGNING_SECRET=@generate
         LEDGER_URL=http://127.0.0.1:4007
         PRICING_URL=http://127.0.0.1:4006
         BILLING_URL=http://127.0.0.1:4009
@@ -98,13 +107,25 @@ jobs:
         working-directory: trade
         run: pnpm install --frozen-lockfile
 
+      # `src/migrator.ts` imports `src/env.ts`, so the migrator validates this environment too — and
+      # OUTBOX_SIGNING_SECRET is now checked by @cloudsforge/secrets, which refuses
+      # `ci-only-not-a-real-secret-…` and has no CI exemption. The `@generate` marker service-ci.yml
+      # understands is a `smoke-env` feature and does NOT apply to a step's `env:` mapping, so this
+      # job generates its own and hands it on through $GITHUB_ENV. Masked because a generated value
+      # is still key material for the four minutes it exists; thrown away with the runner.
+      - name: A real signing secret for the migrator, generated per run
+        run: |
+          set -euo pipefail
+          secret="$(openssl rand -base64 48)"
+          echo "::add-mask::${secret}"
+          echo "OUTBOX_SIGNING_SECRET=${secret}" >> "$GITHUB_ENV"
+
       - name: Migrate the test database
         working-directory: trade
         env:
           TRADE_DATABASE_URL: postgres://trade:trade@127.0.0.1:5432/trade_test
           IDENTITY_JWKS_URL: http://127.0.0.1:4001/.well-known/jwks.json
           IDENTITY_ISSUER: http://127.0.0.1:4001
-          OUTBOX_SIGNING_SECRET: ci-only-not-a-real-secret-000000000000
           LEDGER_URL: http://127.0.0.1:4007
           PRICING_URL: http://127.0.0.1:4006
           BILLING_URL: http://127.0.0.1:4009
@@ -119,7 +140,6 @@ jobs:
           TRADE_DATABASE_URL: postgres://trade:trade@127.0.0.1:5432/trade_test
           IDENTITY_JWKS_URL: http://127.0.0.1:4001/.well-known/jwks.json
           IDENTITY_ISSUER: http://127.0.0.1:4001
-          OUTBOX_SIGNING_SECRET: ci-only-not-a-real-secret-000000000000
           LEDGER_URL: http://127.0.0.1:4007
           PRICING_URL: http://127.0.0.1:4006
           BILLING_URL: http://127.0.0.1:4009

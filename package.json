@@ -1,6 +1,6 @@
 {
   "name": "@cloudsforge/trade",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
   "description": "Forge Trade — backtesting, paper and live trading bots. Carries the Crucible engine forward intact and fixes the concurrency defects around it: one settlement per period at the schema level, post-trade state written with the fill, leased jobs instead of timers, backtests off the request path, and capital held as a real ledger reservation.",
   "license": "MIT",
@@ -40,6 +40,7 @@
     "@cloudsforge/http": "file:../runtime/packages/http",
     "@cloudsforge/jobs": "file:../runtime/packages/jobs",
     "@cloudsforge/lifecycle": "file:../runtime/packages/lifecycle",
+    "@cloudsforge/secrets": "file:../runtime/packages/secrets",
     "@cloudsforge/telemetry": "file:../runtime/packages/telemetry",
     "postgres": "^3.4.5",
     "tsx": "^4.19.2"

@@ -19,6 +19,7 @@
  */
 
 import { hostname } from 'node:os'
+import { assertGeneratedSecret, assertGeneratedSecretList } from '@cloudsforge/secrets'
 
 /**
  * The service's own name. A constant rather than a variable: it is a property of the repository,
@@ -72,6 +73,32 @@ function requiredSecret(source: Source, name: string, minLength = 24): string {
   return value
 }
 
+/**
+ * The estate's shared event-bus HMAC key, held to a SHAPE rather than to a deny-list.
+ *
+ * `requiredSecret` above cannot be the guard for this one. It refuses a fixed list of exact strings
+ * and anything under 24 characters, and the value that sat on 54 lines of a PUBLIC compose file —
+ * `estate-only-outbox-secret-00000000000000` — was on no list and was 40 characters, so it passed
+ * every service in the estate (micro-org #142). A check that could not fail read as the absence of
+ * a problem. Here that key is also what verifies `identity.user.deleted` on `POST /v1/events`, so a
+ * forgeable one is a delete-anyone endpoint.
+ *
+ * `assertGeneratedSecret` asserts what a placeholder cannot have: the base64 or hex alphabet (no
+ * hyphens — every placeholder this estate wrote had one), 32 decoded BYTES rather than 24
+ * keystrokes, and a measured Shannon entropy floor. It has no NODE_ENV exemption and no escape
+ * hatch, so CI generates a real value per run rather than being let through.
+ *
+ * `required` rather than `requiredSecret`, deliberately: the weaker checks are a strict subset of
+ * the stronger ones, and running them first would answer a 40-character placeholder with "must be
+ * at least 24 characters" — a message that is true, useless, and points the operator at the wrong
+ * property.
+ */
+function requiredSigningSecret(source: Source, name: string): string {
+  const value = required(source, name)
+  assertGeneratedSecret(name, value)
+  return value
+}
+
 function optional(source: Source, name: string, fallback: string): string {
   const value = source[name]?.trim()
   return value && value.length > 0 ? value : fallback
@@ -105,8 +132,17 @@ function boolean(source: Source, name: string, fallback: boolean): boolean {
  * partition is an erasure obligation quietly not met.
  *
  * Copied from `devplatform/src/env.ts:103`, which took the shape from activity's
- * `ACTIVITY_INGEST_SECRETS`. Each entry is validated exactly as a single secret is: a list is not a
- * way to smuggle in a value that `requiredSecret` would refuse on its own.
+ * `ACTIVITY_INGEST_SECRETS`. Each entry is validated exactly as the signing secret is, by the same
+ * `@cloudsforge/secrets` gate: a list is not a way to smuggle in a value that would be refused on
+ * its own. The list does NOT get a weaker rule because it is "just for the drain" — in an overlap
+ * window the OUTGOING key is the one an attacker already holds if it leaked, and "just for the
+ * drain" is exactly how a placeholder survives the rotation meant to remove it (micro-org #142).
+ *
+ * The old per-entry checks — the `PLACEHOLDERS` set and a 24-character floor — are gone rather than
+ * kept in front, for the reason given on `requiredSigningSecret`: they are a strict subset of the
+ * shape check, and running them first answers a 40-character placeholder by complaining about its
+ * length. What stays is what the shape check does not do: the "at least one entry" rule, because an
+ * empty accept list is a silent partition, and the duplicate rule below.
  */
 export function parseSecretList(raw: string, name: string): readonly string[] {
   const entries = raw
@@ -114,14 +150,7 @@ export function parseSecretList(raw: string, name: string): readonly string[] {
     .map((entry) => entry.trim())
     .filter((entry) => entry.length > 0)
   if (entries.length === 0) throw new EnvError(`${name} is required — at least one secret`)
-  for (const entry of entries) {
-    if (PLACEHOLDERS.has(entry.toLowerCase())) {
-      throw new EnvError(`${name} contains a known placeholder — generate real secrets`)
-    }
-    if (entry.length < 24) {
-      throw new EnvError(`${name} entries must each be at least 24 characters`)
-    }
-  }
+  assertGeneratedSecretList(name, entries)
   if (new Set(entries).size !== entries.length) {
     // A duplicated secret makes the "which key verified this" answer ambiguous, and that answer is
     // what tells an operator whether a rotation has finished and the old key can be dropped.
@@ -210,7 +239,7 @@ export function loadEnv(source: Source = process.env, host = ''): Env {
     throw new EnvError(`LOG_LEVEL must be one of debug, info, warn, error (got ${logLevel})`)
   }
   // Read before the object literal because the accept list falls back to it.
-  const outboxSigningSecret = requiredSecret(source, 'OUTBOX_SIGNING_SECRET')
+  const outboxSigningSecret = requiredSigningSecret(source, 'OUTBOX_SIGNING_SECRET')
   return {
     port: integer(source, 'PORT', 4000, 1, 65_535),
     env: optional(source, 'NODE_ENV', 'development'),

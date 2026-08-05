@@ -35,6 +35,9 @@ importers:
       '@cloudsforge/lifecycle':
         specifier: file:../runtime/packages/lifecycle
         version: file:../runtime/packages/lifecycle
+      '@cloudsforge/secrets':
+        specifier: file:../runtime/packages/secrets
+        version: file:../runtime/packages/secrets
       '@cloudsforge/telemetry':
         specifier: file:../runtime/packages/telemetry
         version: file:../runtime/packages/telemetry
@@ -75,6 +78,10 @@ packages:
 
   '@cloudsforge/lifecycle@file:../runtime/packages/lifecycle':
     resolution: {directory: ../runtime/packages/lifecycle, type: directory}
+    engines: {node: '>=22'}
+
+  '@cloudsforge/secrets@file:../runtime/packages/secrets':
+    resolution: {directory: ../runtime/packages/secrets, type: directory}
     engines: {node: '>=22'}
 
   '@cloudsforge/telemetry@file:../runtime/packages/telemetry':
@@ -291,6 +298,8 @@ snapshots:
       postgres: 3.4.9
 
   '@cloudsforge/lifecycle@file:../runtime/packages/lifecycle': {}
+
+  '@cloudsforge/secrets@file:../runtime/packages/secrets': {}
 
   '@cloudsforge/telemetry@file:../runtime/packages/telemetry':
     dependencies:
