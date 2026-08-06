@@ -5,7 +5,7 @@
  * `JobQueue` and `JobRunner` against a real Postgres, with two runners under different owners
  * claiming from one table — because the bug class being tested is precisely one that a module-local
  * latch cannot see. The frozen service's only guard is `let running = false`
- * (`crucible/services/crucible/src/runner.ts:60`), which is invisible to a second process, and that
+ * (`crucible/services/crucible/src/runner.ts`), which is invisible to a second process, and that
  * is why it cannot be scaled past one replica.
  *
  * The other half of this file is refusal: a bot that cannot get a price, or whose data has stopped

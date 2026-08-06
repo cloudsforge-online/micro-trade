@@ -3,8 +3,8 @@
  *
  * Rule 8 of docs/ecosystem/03 §2: every background timer is a leased job. **There is no
  * `setInterval` in this repository**, and CI greps for one. The frozen service runs two
- * (`crucible/services/crucible/src/runner.ts:510` and `:513`), each guarded only by a module-local
- * boolean (`let running = false` at `runner.ts:61`, `let settling = false` at `runner.ts:410`) — a variable that by construction cannot
+ * (`crucible/services/crucible/src/runner.ts` and), each guarded only by a module-local
+ * boolean (`let running = false` at `runner.ts`, `let settling = false` at `runner.ts`) — a variable that by construction cannot
  * be seen by a second process, which is why that service cannot be scaled past one replica and why
  * its settlement sweep races its own stop route at one replica.
  *
@@ -133,7 +133,7 @@ export function registerHandlers(runner: JobRunner, deps: JobDeps): JobRunner {
    * The tick producer.
    *
    * A sweep that enqueues, rather than a sweep that ticks. The frozen loop evaluates every running
-   * bot serially inside one pass (`crucible/services/crucible/src/runner.ts:386-404`), so one slow
+   * bot serially inside one pass (`crucible/services/crucible/src/runner.ts`), so one slow
    * bot delays every other bot behind it and the whole pass is one process's work. Enqueuing means
    * the fleet is worked by every replica at once, and a bot that is wedged holds up only itself.
    */

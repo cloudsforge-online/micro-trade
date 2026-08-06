@@ -2,7 +2,7 @@
  * Fills. **A fill is money.**
  *
  * The whole file is one argument, and it is the same one the frozen service makes at
- * `crucible/services/crucible/src/runner.ts:263-276`: the row is written FIRST, before anything
+ * `crucible/services/crucible/src/runner.ts`: the row is written FIRST, before anything
  * moves, because the gap between deciding to fill and having filled is exactly where a crash costs
  * somebody money.
  *
@@ -13,7 +13,7 @@
  *
  *   1. **`fills_bot_bar_side_uniq`.** A duplicate evaluation of the same bar loses the insert and
  *      stops here rather than at the ledger. This is the frozen service's index
- *      (`crucible/services/crucible/src/db/migrate.ts:159`), carried forward because it is right.
+ *      (`crucible/services/crucible/src/db/migrate.ts`), carried forward because it is right.
  *   2. **A derived idempotency key.** `trade:fill:<row id>` — so even a retry of the SAME row, after
  *      an answer was lost, replays the ledger's stored response instead of posting again.
  *   3. **A conditional `UPDATE … WHERE status IN ('planned','unresolved')`.** This is the one the
@@ -29,7 +29,7 @@
  * ledger looked and said no: nothing moved, the row is zeroed, and the bar is done. A timeout or a
  * 5xx means **we do not know**, and writing "nothing moved" would be as much of a claim as leaving
  * the plan there. The frozen runner reaches the same conclusion at
- * `crucible/services/crucible/src/runner.ts:355-358`.
+ * `crucible/services/crucible/src/runner.ts`.
  */
 
 import { amountFrom } from './money.ts'
@@ -180,7 +180,7 @@ export type ApplyResult =
  * the caller passes separately, so the row and the movement cannot disagree. This is the direct fix
  * for the divergence 04 §11 names: the frozen runner writes `cash` and `position` computed in memory
  * and then advances `last_candle_t` in the same statement
- * (`crucible/services/crucible/src/runner.ts:186-196`), so a crash after the ledger moved and before
+ * (`crucible/services/crucible/src/runner.ts`), so a crash after the ledger moved and before
  * that write leaves money moved and a mirror that says it did not — permanently, because the bar
  * pointer has advanced past it.
  */

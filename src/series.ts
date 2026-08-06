@@ -7,7 +7,7 @@
  * (`crucible/services/crucible/src/market/feed.ts`), and caches them in its own table
  * (`crucible/services/crucible/src/market/candles.ts`). That code is good — the fallback exists
  * because "the way Binance fails in a restricted region is an HTTP 451 on every request forever"
- * (`feed.ts:11-15`), which is a real thing somebody learned the hard way.
+ * (`feed.ts`), which is a real thing somebody learned the hard way.
  *
  * It is still not this service's job. 03 §1.1 gives `cloudsforge-market` the market-data surface and
  * gives this repository "strategy catalogue, backtests, bots, fills, allocations, fee settlements,
@@ -22,7 +22,7 @@
  * That is a deliberate, stated trade-off rather than an oversight, and the alternative was worse.
  * `micro-wallet`'s pricing client carries the scar: it was written against `GET /v1/quotes`, a route
  * that "never existed — this client was written against an imagined surface and would have 404'd in
- * production" (`micro-wallet/src/pricingclient.ts:75-78`). Writing a `marketclient.ts` against
+ * production" (`micro-wallet/src/pricingclient.ts`). Writing a `marketclient.ts` against
  * `micro-market`, which today contains one file and no routes at all, would have reproduced exactly
  * that defect. A route that does not exist is not a dependency; it is a guess.
  *
@@ -187,7 +187,7 @@ export async function ingestBars(
  *
  * Newest-first with a LIMIT and then reversed, rather than ascending with an offset: ordering
  * ascending and taking the tail makes Postgres sort the entire history of the series on every call,
- * which the frozen service also learned (`crucible/services/crucible/src/market/candles.ts:19-21`).
+ * which the frozen service also learned (`crucible/services/crucible/src/market/candles.ts`).
  */
 export async function loadBars(sql: Db, seriesId: string, limit: number): Promise<readonly Bar[]> {
   const rows = await sql<BarRow[]>`
@@ -214,7 +214,7 @@ export async function loadAllBars(sql: Db, seriesId: string): Promise<readonly B
  * A bot refuses to act on a series that has stopped updating. Trading on a price that stopped an
  * hour ago is worse than not trading: the signal is computed from a market that has moved on, and in
  * live mode it settles against an oracle that has not. The frozen runner makes the same check at
- * `crucible/services/crucible/src/runner.ts:124-131`; the difference is that this one takes its
+ * `crucible/services/crucible/src/runner.ts`; the difference is that this one takes its
  * clock as an argument.
  */
 export function stalenessIntervals(newest: Bar, timeframe: Timeframe, clock: Clock): number {

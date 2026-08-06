@@ -32,7 +32,7 @@
  * once a minute: the grid re-anchored to the window's high, the trailing stop forgot its position,
  * and DCA — which fired when the bar INDEX was a multiple of its interval — either never fired or
  * bought its entire remaining allocation in one go. The frozen file's own comment at
- * `crucible/services/crucible/src/engine/strategies.ts:26-47` records this, and the fix is carried
+ * `crucible/services/crucible/src/engine/strategies.ts` records this, and the fix is carried
  * forward with it: the runner hands back what it was given, plus the index of the first bar it has
  * not folded in yet.
  */

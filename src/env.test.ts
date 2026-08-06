@@ -158,7 +158,7 @@ test('a short secret is refused, because length is the only entropy proxy availa
  * `identity.user.deleted`, so a partition is an erasure obligation quietly not met.
  *
  * A rolling rotation is only possible if the RECEIVER accepts more than one secret at a time.
- * `verifyDelivery` has taken a list since `contracts/packages/events/src/index.ts:1412`; what was
+ * `verifyDelivery` has taken a list since `contracts/packages/events/src/index.ts`; what was
  * missing here was the env plumbing.
  */
 test('OUTBOX_ACCEPT_SECRETS is absent by default, and the service accepts exactly the signing secret', () => {

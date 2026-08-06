@@ -45,62 +45,62 @@ Every path below is relative to `stack/repos/crucible/`, which is frozen and unm
 |---|---|---|
 | **Technical indicators** — SMA, EMA, Wilder RSI, MACD, Bollinger, Wilder ATR, Donchian extremes | `services/crucible/src/engine/indicators.ts` | Input type only. The maths, the warm-up nulls and the original comments are unchanged — it is correct, well argued, and has no money in it |
 | **Ten strategies**, compiled to a target-exposure series, with carried accumulators for grid / ATR-trailing / DCA | `services/crucible/src/engine/strategies.ts` | Target is integer **basis points**, not a float fraction. The rules are identical |
-| **The strategy catalogue** and `normalizeParams`, including both cross-field repairs | `packages/contracts/src/index.ts:117-353` | Prose condensed; every number kept, because the defaults are calibrated against the indicator definitions |
+| **The strategy catalogue** and `normalizeParams`, including both cross-field repairs | `packages/contracts/src/index.ts` | Prose condensed; every number kept, because the defaults are calibrated against the indicator definitions |
 | **The backtest loop** — signal from bar *i* fills at bar *i+1*'s **open**, average cost basis on a partial exit, minimum-rebalance threshold, curve decimation with metrics computed pre-decimation | `services/crucible/src/engine/backtest.ts` | Money rewritten in `bigint`; a stored seed and a result digest added |
 | **Performance metrics** — annualised Sharpe/Sortino, Calmar, max drawdown, profit factor, like-for-like buy-and-hold benchmark | `services/crucible/src/engine/metrics.ts` | Amounts are `bigint`, proportions are `bigint` basis points, only volatility ratios stay `number` |
 | **The performance fee and its four invariants** — high-water mark, one row one key one amount, debt-before-row, unknown-is-not-refusal | `services/crucible/src/fees.ts` | Carried forward in full, plus a fifth enforced by the schema (below) |
-| **`assess` vs `arrears` scope**, and the argument that a paused bot must never be assessed | `services/crucible/src/fees.ts:69-97` | Unchanged |
-| **The sweep's second list** — bots that have left the running set still owing something | `services/crucible/src/runner.ts:441-449`, `store.ts:347-381` | Now `unsettledBotIds`, same predicate |
-| **One fill per (bot, bar, side)** | `services/crucible/src/db/migrate.ts:159` | Kept verbatim in intent. The single best line in that repository |
-| **The bar-staleness refusal** and the sliding-window replay guard (`from`, so a fresh DCA does not spend its whole allocation at once) | `services/crucible/src/runner.ts:124-131`, `:154-169` | Clock injected |
-| **Paper execution priced like the backtest**, so a paper bot cannot beat the backtest of its own rule | `services/crucible/src/runner.ts:217-261` | Same constants, in `bigint` |
-| **The live kill switch read per tick**, not at creation | `services/crucible/src/runner.ts:47-58` | Now a field on a frozen env object |
+| **`assess` vs `arrears` scope**, and the argument that a paused bot must never be assessed | `services/crucible/src/fees.ts` | Unchanged |
+| **The sweep's second list** — bots that have left the running set still owing something | `services/crucible/src/runner.ts`, `store.ts` | Now `unsettledBotIds`, same predicate |
+| **One fill per (bot, bar, side)** | `services/crucible/src/db/migrate.ts` | Kept verbatim in intent. The single best line in that repository |
+| **The bar-staleness refusal** and the sliding-window replay guard (`from`, so a fresh DCA does not spend its whole allocation at once) | `services/crucible/src/runner.ts` | Clock injected |
+| **Paper execution priced like the backtest**, so a paper bot cannot beat the backtest of its own rule | `services/crucible/src/runner.ts` | Same constants, in `bigint` |
+| **The live kill switch read per tick**, not at creation | `services/crucible/src/runner.ts` | Now a field on a frozen env object |
 
 ## Deliberately dropped
 
 | What | From | Why |
 |---|---|---|
-| **The exchange feed** — Binance primary, Kraken fallback, candle cache | `services/crucible/src/market/feed.ts`, `market/candles.ts` | Not this repository's remit. 03 §1.1 gives market data to `cloudsforge-market`; a service that fetches its own prices will eventually disagree with the one that owns them. Bars now **arrive** via `POST /v1/series/:id/bars` rather than being fetched. A `marketclient.ts` was *not* written: `micro-market` today contains one file and no routes, and writing a client against an imagined surface is the exact defect `micro-wallet/src/pricingclient.ts:75-78` records ("`/v1/quotes` … never existed … would have 404'd in production") |
-| **`setInterval` for the tick and the settlement sweep** | `services/crucible/src/runner.ts:510`, `:513` | Rule 8. Both are now leased jobs claimed `for update skip locked`. Their only guard was a module-local boolean (`runner.ts:61`, `:410`) — invisible to a second process, which is why that service cannot be scaled past one replica |
-| **Synchronous backtests inside the POST** | `services/crucible/src/routes/backtests.ts:30-128` | Its own comment argues the case and is right about the cost, wrong about the risk: the ten-second drain kills an in-flight run and the `queued` row is never retried. Now 202 + a status URL + `backtest.run` under a lease |
-| **`fetchJson` and the hand-rolled upstream client** | `services/crucible/src/obs.ts:338-375`, `clients/pay.ts` | Replaced by `@cloudsforge/http`, which already has the deadline, the bounded retry, the circuit breaker and the URL redaction |
-| **Quantities as decimal strings parsed with `Number()`** | `packages/contracts/src/index.ts:648-655` | A float in a text column. Positions are now `numeric(78,0)` smallest units |
-| **`bigint({ mode: 'number' })` money columns** | `services/crucible/src/db/schema.ts:66-75` | Every balance in that service is a float wearing an integer's name. 04 §0 forbids it |
+| **The exchange feed** — Binance primary, Kraken fallback, candle cache | `services/crucible/src/market/feed.ts`, `market/candles.ts` | Not this repository's remit. 03 §1.1 gives market data to `cloudsforge-market`; a service that fetches its own prices will eventually disagree with the one that owns them. Bars now **arrive** via `POST /v1/series/:id/bars` rather than being fetched. A `marketclient.ts` was *not* written: `micro-market` today contains one file and no routes, and writing a client against an imagined surface is the exact defect `micro-wallet/src/pricingclient.ts` records ("`/v1/quotes` … never existed … would have 404'd in production") |
+| **`setInterval` for the tick and the settlement sweep** | `services/crucible/src/runner.ts` | Rule 8. Both are now leased jobs claimed `for update skip locked`. Their only guard was a module-local boolean (`runner.ts`) — invisible to a second process, which is why that service cannot be scaled past one replica |
+| **Synchronous backtests inside the POST** | `services/crucible/src/routes/backtests.ts` | Its own comment argues the case and is right about the cost, wrong about the risk: the ten-second drain kills an in-flight run and the `queued` row is never retried. Now 202 + a status URL + `backtest.run` under a lease |
+| **`fetchJson` and the hand-rolled upstream client** | `services/crucible/src/obs.ts`, `clients/pay.ts` | Replaced by `@cloudsforge/http`, which already has the deadline, the bounded retry, the circuit breaker and the URL redaction |
+| **Quantities as decimal strings parsed with `Number()`** | `packages/contracts/src/index.ts` | A float in a text column. Positions are now `numeric(78,0)` smallest units |
+| **`bigint({ mode: 'number' })` money columns** | `services/crucible/src/db/schema.ts` | Every balance in that service is a float wearing an integer's name. 04 §0 forbids it |
 | **Liquidating the position on stop** | `services/crucible/src/routes/bots.ts` | Selling a user's holding because they turned a bot off is a decision the user did not make. Stopping now re-marks from a fresh price and assesses; with no usable price it falls back to `arrears` and the sweep assesses later |
 | **A separate taker fee on a live fill** | — | The spread already is the cost. Pricing serves `usdBuyScaled`/`usdSellScaled` and this service fills on those legs; charging a fee on top would bill the cost twice. Revenue is the performance fee |
 
 ## Added, because the frozen service could not add it from inside itself
 
 - **`fee_settlements_bot_period_uniq`.** A settlement's identity is `(bot_id, period)` and its ledger
-  key is derived from the same pair. The frozen row is `randomUUID()` (`store.ts:452`) and its
-  upstream key is derived from that id (`clients/pay.ts:134`), so two attempts at one settlement mint
+  key is derived from the same pair. The frozen row is `randomUUID()` (`store.ts`) and its
+  upstream key is derived from that id (`clients/pay.ts`), so two attempts at one settlement mint
   two different keys and the upstream honours both — `fee_settlements` has no unique constraint
-  (`db/migrate.ts:199-207` creates three plain indexes and no unique one). That race is live at one
+  (`db/migrate.ts` creates three plain indexes and no unique one). That race is live at one
   replica, between the sweep and the stop route. 14 §5 makes the test mandatory; it is
   `two sweeps and a stop racing one period produce exactly one settlement`.
 - **Cash and position move only inside `applyFill`**, in the same transaction as the fill row it
   claims. The frozen `tickBot` writes them from an in-memory snapshot alongside an advanced bar
-  pointer (`runner.ts:186-196`), so a crash between the money moving and that write leaves money
+  pointer (`runner.ts`), so a crash between the money moving and that write leaves money
   moved and a mirror that says it did not — permanently, because the pointer has gone past the bar.
   04 §11 names this defect by name. `updateBot` here has no field that could write either column.
 - **Deterministic backtests, provably.** A stored seed, an injected clock, a seeded PRNG, and a
   sha256 digest over the stored result. Same strategy + same series + same seed ⇒ byte-identical.
 - **Idempotency on every mutating route**, fingerprinted excluding `correlationId`.
 - **An outbox, an inbox, `/livez`, `/readyz`, `/metrics`, and a drain.**
-- **`GET /v1/backtests/:id/result` (`src/server.ts:447`) — the curve that was computed and served
-  to nobody.** `runBacktest` writes `trades` and `equity` (`src/backtests.ts:222-223`) into columns
-  that exist (`src/migrations.ts:206-207`), but `COLUMNS` (`src/backtests.ts:79-80`) listed neither,
+- **`GET /v1/backtests/:id/result` (`src/server.ts`) — the curve that was computed and served
+  to nobody.** `runBacktest` writes `trades` and `equity` (`src/backtests.ts`) into columns
+  that exist (`src/migrations.ts`), but `COLUMNS` (`src/backtests.ts`) listed neither,
   so **no read path could reach them**. Every report could say how deep a drawdown was and never
   when it happened, which is the question a curve exists to answer. Served separately rather than
   added to `COLUMNS`, so the index page does not pay for a chart nobody has opened. A run that has
   not completed is a **409 naming its state**, never a 200 with empty arrays: an empty fill list is
   a real result — a strategy that never traded — and it must not read as "not finished yet".
-- **`GET /v1/capabilities` (`src/server.ts:361`) — what this deployment will actually let you do.**
-  `TRADE_LIVE_ENABLED` defaults to false (`src/env.ts:181`) and is read per tick, and **nothing
+- **`GET /v1/capabilities` (`src/server.ts`) — what this deployment will actually let you do.**
+  `TRADE_LIVE_ENABLED` defaults to false (`src/env.ts`) and is read per tick, and **nothing
   reported it**: a customer could configure a live bot and learn the switch was off only when it
   declined to tick. Public and unauthenticated, like the catalogue, because it is a property of the
   deployment and not of the caller. When live is off the body carries `LIVE_DISABLED`
-  (`src/bots.ts:90`) **verbatim** — the same sentence the engine writes onto a bot it refuses — so
+  (`src/bots.ts`) **verbatim** — the same sentence the engine writes onto a bot it refuses — so
   a client's warning and the eventual refusal cannot say different things.
 
 ---
@@ -110,28 +110,26 @@ Every path below is relative to `stack/repos/crucible/`, which is frozen and unm
 Everything cited above was re-read in the frozen source rather than taken from a summary. Three
 inherited statements did not survive that:
 
-1. **`stack/MICROSERVICES.md:187` — "There are also **zero retries anywhere**." This is false.**
+1. **`stack/MICROSERVICES.md` — "There are also **zero retries anywhere**." This is false.**
    Crucible has a real retry loop, and it is the ancestor of `src/fees.ts`. `resolvePending`
-   (`services/crucible/src/fees.ts:271-330`) re-sends every undecided settlement under its *original*
-   idempotency key on every pass; `settlementSweep` (`runner.ts:431-505`) drives it over the running
+   (`services/crucible/src/fees.ts`) re-sends every undecided settlement under its *original*
+   idempotency key on every pass; `settlementSweep` (`runner.ts`) drives it over the running
    bots **and** over the ones that have left the running set still owing something
-   (`store.ts:347-381`). The horizon is unbounded by design, the `attempted` column exists
-   specifically so a retry re-sends a byte-identical request (`db/migrate.ts:176-178`), and the stop
+   (`store.ts`). The horizon is unbounded by design, the `attempted` column exists
+   specifically so a retry re-sends a byte-identical request (`db/migrate.ts`), and the stop
    route documents the promise in as many words — "the settlement sweep will retry it"
-   (`routes/bots.ts:301-313`). What the frozen estate genuinely lacks is *in-request* retry inside its
-   HTTP client (`obs.ts:338-375` has a timeout and no backoff) — a much smaller and much less
+   (`routes/bots.ts`). What the frozen estate genuinely lacks is *in-request* retry inside its
+   HTTP client (`obs.ts` has a timeout and no backoff) — a much smaller and much less
    interesting claim than the one that was written down.
 
-2. **`stack/MICROSERVICES.md:92-96` — "`tickBot` … writes `cash`/`position` from its *pre-trade*
+2. **`stack/MICROSERVICES.md` — "`tickBot` … writes `cash`/`position` from its *pre-trade*
    snapshot" — is stale for the path it cites.** On the success path the frozen runner *does* use the
-   post-trade result (`runner.ts:176-183` assigns from `execute`'s return before the write at
-   `:186-196`). The real defect is narrower and worse: on an **unknown** outcome — a timeout or a 5xx
+   post-trade result (`runner.ts` assigns from `execute`'s return before the write). The real defect is narrower and worse: on an **unknown** outcome — a timeout or a 5xx
    — it keeps the pre-trade snapshot and advances `lastCandleT` anyway, so money that may have moved
    is never reconciled. That is the version this repository fixes.
 
-3. **Several line citations in `stack/MICROSERVICES.md` have drifted.** It cites `store.ts:359` for
-   `insertSettlement` (actually `:452`) and `runner.ts:437`/`:440` for the two timers (actually
-   `:510`/`:513`). The findings behind them are real; the coordinates are not.
+3. **Several line citations in `stack/MICROSERVICES.md` have drifted.** It cites `store.ts` for
+   `insertSettlement` (actually) and `runner.ts`/ for the two timers (actually/). The findings behind them are real; the coordinates are not.
 
 ## Findings against `micro-org` — all three now fixed upstream
 

@@ -128,7 +128,7 @@ export const AWAITING_REGISTRATION: Readonly<Record<string, ProposedTopic>> = Ob
   // `trade.bot.paused` was here until contracts-events registered it (micro-contracts 8889373,
   // adopted verbatim: `keyedBy: 'bot_id'`, `payloadType: 'BotPaused'`). Deleted rather than kept
   // with a note, because `adoptedProposals()` fails while it is present and that failure IS the
-  // self-emptying quarantine. `bots.ts:614` still passes `bot.id` as the key, which is what the
+  // self-emptying quarantine. `bots.ts` still passes `bot.id` as the key, which is what the
   // registered `keyedBy` names; `topics.test.ts` now pins that agreement from this side.
   'trade.fill.settled': {
     reason:
@@ -170,7 +170,7 @@ export function undeclaredTopics(emitted: readonly string[]): readonly string[] 
  * classify the topic, the code path renders it, and nothing ever arrives. It used to be empty
  * vacuously — the registry owned no trade topic at all, so there was nothing for it to find. Since
  * `trade.bot.paused` was registered it is a real check with one topic to answer for: delete or
- * rename `bots.ts:614` and this returns it, naming a consumer that would wait for ever.
+ * rename `bots.ts` and this returns it, naming a consumer that would wait for ever.
  */
 export function unemittedOwnedTopics(emitted: readonly string[]): readonly TopicName[] {
   const seen = new Set(emitted)

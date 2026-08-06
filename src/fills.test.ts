@@ -225,7 +225,7 @@ test('a refusal zeroes the fill, because the ledger looked and said nothing move
 })
 
 test('an unreachable ledger leaves the fill unresolved, never refused', { skip }, async () => {
-  // The distinction the frozen runner draws at runner.ts:355-358, and the one that matters: writing
+  // The distinction the frozen runner draws at runner.ts, and the one that matters: writing
   // "nothing moved" would be as much of a claim as leaving the plan there.
   ledger.failNext(1)
   const fill = await bookFill(db, planned())

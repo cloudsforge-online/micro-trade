@@ -31,7 +31,7 @@
  *
  * ## The route
  *
- * `GET /rates`. Verified against `micro-pricing/src/server.ts:312` — the board is returned whole
+ * `GET /rates`. Verified against `micro-pricing/src/server.ts` — the board is returned whole
  * rather than filtered by asset, it is small and fixed, and asking for a subset would let the board
  * silently forget an asset exists. There is no `/quotes` and no `/v1/quotes`; the client that
  * assumed there was is the defect this comment exists to avoid repeating.
@@ -52,7 +52,7 @@ import type { Clock } from './rng.ts'
  * ── AND THIS GRANT IS WIDER THAN THE CALL SITE NEEDS ─────────────────────────────────────────
  *
  * `pricing:read` is registered and pricing enforces it, but the ONE route this client calls,
- * `GET /rates` (`pricing/src/server.ts:312`), is not gated at all — the board is public. So the
+ * `GET /rates` (`pricing/src/server.ts`), is not gated at all — the board is public. So the
  * honest declaration is "nothing", and it is not written here yet for a reason belonging to the
  * derivation rather than to this service: `derive-grants.mjs` treats a module that presents a
  * credential and declares no scope as an undeclared gap and fails the estate build.

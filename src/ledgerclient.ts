@@ -35,7 +35,7 @@
  * and the only safe response is to retry under the same idempotency key.
  *
  * Getting that backwards is how the frozen service's fee loop double-billed people, and its own
- * comment says so at `crucible/services/crucible/src/fees.ts:53-66`: an unknown outcome written off
+ * comment says so at `crucible/services/crucible/src/fees.ts`: an unknown outcome written off
  * as a refusal "restored the whole debt to `feeOwed` … The next pass then re-billed the identical
  * arrears under a BRAND NEW key … One lost answer, two debits."
  */
@@ -61,7 +61,7 @@ import type { LiveScope } from '@cloudsforge/contracts-auth'
  * DEPRECATED ones included — and identity will not mint a deprecated scope either. `LiveScope =
  * Exclude<Scope, DeprecatedScope>`, with `DeprecatedScope` computed FROM `SCOPES` by a conditional
  * type over the `deprecated` field rather than hand-listed, so it cannot drift from the registry
- * (`contracts/packages/auth/src/index.ts:507`). Reading a token stays wide — one may arrive
+ * (`contracts/packages/auth/src/index.ts`). Reading a token stays wide — one may arrive
  * carrying a scope that has since died — and demanding is narrow. This is demanding.
  */
 export const LEDGER_SCOPES: readonly LiveScope[] = Object.freeze([
@@ -234,7 +234,7 @@ export function fillPostings(input: {
  * Charged against the user's wallet, **not deducted from the bot**. Deducting from the bot would
  * silently shrink the position the user chose, and would make the equity curve a function of our
  * billing. The frozen service makes the same choice for the same reason
- * (`crucible/services/crucible/src/fees.ts:29-31`) and it is carried forward.
+ * (`crucible/services/crucible/src/fees.ts`) and it is carried forward.
  */
 export function performanceFeePostings(input: {
   readonly userId: string
@@ -274,8 +274,8 @@ export const fillIdempotencyKey = (fillId: string): string => `trade:fill:${fill
  *
  * Derived from `(botId, period)` rather than from a random row id. This is the fix for the defect
  * `micro-org`'s own testing strategy names at 14 §5: the frozen key is
- * `crucible:settlement:<randomUUID>` (`crucible/services/crucible/src/store.ts:452` +
- * `clients/pay.ts:134`), so two attempts at one settlement produce two different keys and the
+ * `crucible:settlement:<randomUUID>` (`crucible/services/crucible/src/store.ts` +
+ * `clients/pay.ts`), so two attempts at one settlement produce two different keys and the
  * upstream honours both. Deriving it from the period means the second attempt cannot invent a new
  * one, and `fee_settlements_bot_period_uniq` means it cannot get a row to derive one from either.
  */
@@ -417,7 +417,7 @@ interface RawBalance {
  * `idempotency_in_flight` is pulled out of the 409s deliberately. The ledger answers 409 for
  * insufficient funds AND for both idempotency conditions, so the status alone does not identify the
  * cause — a distinction the frozen client also had to make
- * (`crucible/services/crucible/src/clients/pay.ts:77-79`). An in-flight duplicate is a retry-later,
+ * (`crucible/services/crucible/src/clients/pay.ts`). An in-flight duplicate is a retry-later,
  * not a failure, and must not be reported as one.
  */
 function translate(err: unknown): Error {

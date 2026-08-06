@@ -165,7 +165,7 @@ jobs:
         run: |
           # Comments are stripped first — the sixth guard in this estate to fire on its own
           # rationale otherwise: every current use of the word is a comment citing the frozen
-          # store.ts:452 defect this rule exists to prevent.
+          # store.ts defect this rule exists to prevent.
           scan=$(mktemp -d)
           find src -name '*.ts' ! -name '*.test.ts' -print0 | while IFS= read -r -d '' f; do
             mkdir -p "$scan/$(dirname "$f")"
@@ -205,9 +205,9 @@ jobs:
 
   # ──────────────────────────────────────────────────────────────────────────────────────────────
   # THE IMAGE, PUBLISHED. `cfctl release` writes a manifest naming ghcr.io/cloudsforge-online/<repo>
-  # at this repository's package.json version (micro-org tools/cfctl.ts:889-934, image name derived
-  # at tools/registry.ts:367-369); `cfctl release --verify` runs `docker manifest inspect` on every
-  # entry (cfctl.ts:937-975); and deploy/scripts/release-deploy.sh:99-125 refuses to change anything
+  # at this repository's package.json version (micro-org tools/cfctl.ts, image name derived
+  # at tools/registry.ts); `cfctl release --verify` runs `docker manifest inspect` on every
+  # entry (cfctl.ts); and deploy/scripts/release-deploy.sh refuses to change anything
   # until all of them pull. Until this job existed CI built this image and threw it away, so that
   # gate rejected every service in the estate and the manifest path could not be used at all.
   #

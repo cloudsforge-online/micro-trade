@@ -183,7 +183,7 @@ test('a pending proposal disappears once contracts adopts it', () => {
  * key AS the subject id, so every export was filed against a user that does not exist. Every name
  * check in the estate passed throughout, because every name was right.
  *
- * `micro-contracts` checked this once, by reading `bots.ts:614` while adopting the spec. That is a
+ * `micro-contracts` checked this once, by reading `bots.ts` while adopting the spec. That is a
  * check with no expiry date attached: it cannot notice the emit site changing afterwards. This is
  * the standing version — it reads the real emit site out of `src/` and matches it against the
  * registered `keyedBy`, so moving the key to (say) `bot.userId` goes red here rather than silently
@@ -351,7 +351,7 @@ test('a delivery signed with a superseded secret verifies while the new secret l
 /**
  * A guard that proves a topic name is correct proves nothing about whether the emit is reached.
  *
- * `identity/src/sessions.ts:390` exports `emitSessionRevoked` and NOTHING CALLS IT — `revokeSession`
+ * `identity/src/sessions.ts` exports `emitSessionRevoked` and NOTHING CALLS IT — `revokeSession`
  * and `revokeAllSessions` update rows without emitting — so `identity.session.revoked` is produced
  * by dead code while identity's own guard passes, because it scans literals rather than
  * reachability. This is the cheapest check that catches that exact shape.
@@ -362,7 +362,7 @@ test('a delivery signed with a superseded secret verifies while the new secret l
  * './foo.ts'` line mentions it, so a symbol that was imported and then never called read as
  * reached. That is not hypothetical: deleting BOTH `emitKeyRevoked` call sites from `server.ts` and
  * leaving its import left `micro-devplatform`'s suite fully green, with
- * `devplatform.key.revoked` — the topic `11-data-and-contract-strategy.md:363` names as the
+ * `devplatform.key.revoked` — the topic `11-data-and-contract-strategy.md` names as the
  * estate's key-cache flush — produced by nothing at all. The identical detector was here. The check could not fail in exactly the case it was written for, because the
  * import that survives a deleted call is the FIRST thing a reader would delete last.
  *

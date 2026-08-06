@@ -1,7 +1,7 @@
 /**
  * The strategy catalogue.
  *
- * **Ported from `crucible/packages/contracts/src/index.ts:117-353`** — the ten strategy ids, their
+ * **Ported from `crucible/packages/contracts/src/index.ts`** — the ten strategy ids, their
  * families, their parameter specs and `normalizeParams`. The prose is condensed; the numbers are
  * not, because the defaults are calibrated against the indicator definitions in
  * `src/indicators.ts` and changing one without the other silently changes what every preset means.
@@ -197,7 +197,7 @@ export function isStrategyId(id: string): id is StrategyId {
 /**
  * Clamp a caller's parameters into the catalogue's ranges, and say what was changed.
  *
- * Ported from `crucible/packages/contracts/src/index.ts:324-353`, including both cross-field
+ * Ported from `crucible/packages/contracts/src/index.ts`, including both cross-field
  * repairs, because each one exists because a configuration silently produced nothing:
  *
  *   - A crossover whose "fast" leg is slower than its "slow" leg never crosses in the direction the

@@ -10,7 +10,7 @@
  * own close would let the simulation trade on a price it only knew after the fact, which is the
  * difference between a backtest and a fantasy. It also means the final bar's signal is never acted
  * on — there is no next bar to fill it at. This is the frozen engine's rule
- * (`crucible/services/crucible/src/engine/backtest.ts:59-67`) and it is carried forward exactly.
+ * (`crucible/services/crucible/src/engine/backtest.ts`) and it is carried forward exactly.
  *
  * ## The one rule that makes a backtest worth anything
  *
@@ -160,7 +160,7 @@ export function run(input: RunInput): RunResult {
         if (delta > 0n) {
           // The fee comes out of the same cash as the notional. Spending all of it and paying the
           // fee on top is how an account goes quietly negative — the frozen engine caps the notional
-          // for the same reason at `backtest.ts:106`.
+          // for the same reason at `backtest.ts`.
           const affordable = (cash * BPS_SCALE) / (BPS_SCALE + BigInt(feeBps))
           const notional = delta < affordable ? delta : affordable
           const price = slippedPrice(bar.o, effectiveSlippage, 'buy')

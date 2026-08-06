@@ -3,7 +3,7 @@
  *
  * **Ported from `crucible/services/crucible/src/engine/metrics.ts`**, with the money/statistic split
  * made explicit, because the frozen version does not have one and it cost it a bug it documents at
- * `crucible/services/crucible/src/engine/metrics.ts:116-121`: profit factor was reported in DOLLARS
+ * `crucible/services/crucible/src/engine/metrics.ts`: profit factor was reported in DOLLARS
  * for a while and "rendered as a profit factor of 3067 next to ratios of 1.2". A number whose unit
  * is not in its type is a number that will eventually be printed in the wrong one.
  *
@@ -21,7 +21,7 @@
  *
  * The one arithmetic rule that matters: **no proportion is ever computed from a float**. Every bps
  * figure below divides two bigints. The frozen version computes max drawdown as
- * `(peak - value) / peak` in doubles (`metrics.ts:31-42`), which for a large equity and a small fall
+ * `(peak - value) / peak` in doubles (`metrics.ts`), which for a large equity and a small fall
  * loses the fall entirely.
  */
 

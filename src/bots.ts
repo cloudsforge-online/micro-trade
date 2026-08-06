@@ -6,7 +6,7 @@
  * (04 §10.5 names the key), claimed `for update skip locked`, so two replicas are safe by
  * construction rather than by a module-local `let running = false` — which is a variable that by
  * construction cannot be seen by a second process, and is the frozen service's only guard
- * (`crucible/services/crucible/src/runner.ts:61`, `:380-383`).
+ * (`crucible/services/crucible/src/runner.ts`).
  *
  * ## What a tick may and may not write
  *
@@ -16,7 +16,7 @@
  *
  * That split is the fix for 04 §11's named defect. The frozen `tickBot` computes cash and position
  * in memory and writes them alongside an advanced bar pointer
- * (`crucible/services/crucible/src/runner.ts:186-196`), so a crash between the money moving and that
+ * (`crucible/services/crucible/src/runner.ts`), so a crash between the money moving and that
  * write leaves money moved and a mirror that says it did not — permanently, because the pointer has
  * gone past the bar. Here the money movement carries its own bar pointer implicitly (the fill row
  * exists, and `fills_bot_bar_side_uniq` will not allow a second), and a crash before the tick's own
@@ -57,7 +57,7 @@ export const LOOKBACK = 500
  *
  * 50 bps live against 20 bps in the backtest, and the asymmetry is deliberate: a live fill crosses a
  * real spread, so the threshold at which a rebalance stops paying for itself is higher than in a
- * simulation. Both numbers are the frozen service's (`runner.ts:36`, `backtest.ts:32`).
+ * simulation. Both numbers are the frozen service's (`runner.ts`, `backtest.ts`).
  */
 const MIN_REBALANCE_BPS = 50n
 
@@ -75,7 +75,7 @@ const MAX_BAR_AGE_INTERVALS = 3
  *
  * Paper used to convert at the raw rate and book a zero fee in the frozen service, so a paper bot
  * beat the backtest of its own rule every time — "which is the single comparison this product exists
- * to let somebody make" (`crucible/services/crucible/src/runner.ts:217-226`). The two agree here by
+ * to let somebody make" (`crucible/services/crucible/src/runner.ts`). The two agree here by
  * construction rather than by two sets of numbers happening to match.
  */
 export const PAPER_FEE_BPS = 10
@@ -242,7 +242,7 @@ export async function runningBotIds(sql: Db, limit: number): Promise<readonly st
  * owing something or holding an undecided row.
  *
  * The second list is the whole point, and the frozen service says why at
- * `crucible/services/crucible/src/runner.ts:441-449`: a bot is stopped at the moment of its FINAL
+ * `crucible/services/crucible/src/runner.ts`: a bot is stopped at the moment of its FINAL
  * settlement, so it is the likeliest bot in the estate to be carrying an undecided row — and
  * sweeping only the running ones meant that row, and any arrears under it, were never looked at
  * again.
@@ -313,7 +313,7 @@ export interface Rebalance {
 /**
  * Turn a target exposure into a trade, or into nothing.
  *
- * All bigint. The frozen equivalent (`crucible/services/crucible/src/runner.ts:88-101`) does the
+ * All bigint. The frozen equivalent (`crucible/services/crucible/src/runner.ts`) does the
  * same arithmetic in floats and then `Math.floor`s the result, which is a rounding decision made
  * after the precision was already lost.
  */
@@ -444,7 +444,7 @@ export async function tickBot(
   // window warms the indicators up and is NOT this bot's history: folding it in made a bot's first
   // tick behave as though it had been running for 500 bars — a fresh DCA spent its whole allocation
   // at once because the window contained enough bars for every slice. See
-  // `crucible/services/crucible/src/runner.ts:154-163`.
+  // `crucible/services/crucible/src/runner.ts`.
   const seen = bot.lastBarT
   const oldest = bars[0]!
   const continuous = seen !== null && seen >= oldest.t

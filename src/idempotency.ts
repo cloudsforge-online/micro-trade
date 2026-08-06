@@ -2,7 +2,7 @@
  * Run a mutating operation at most once per key.
  *
  * **Taken from `micro-ledger/src/idempotency.ts`, which took it from
- * `repos/forge-pay/services/pay/src/store.ts:153`.** Two changes, both mechanical: the claim row
+ * `repos/forge-pay/services/pay/src/store.ts`.** Two changes, both mechanical: the claim row
  * points at a urn rather than a `journal_entries` id, because what this service creates is a bot, a
  * fill or a settlement rather than an entry; and there is no foreign key, because the claim
  * deliberately outlives some of what it names.

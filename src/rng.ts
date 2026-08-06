@@ -18,7 +18,7 @@
  *
  * The frozen service does not have this problem in its backtest, which is genuinely deterministic
  * — but it has it in its LIVE path, where `tickBot` reads `Date.now()` mid-evaluation to age the
- * candle (`crucible/services/crucible/src/runner.ts:124`). That read is correct behaviour and the
+ * candle (`crucible/services/crucible/src/runner.ts`). That read is correct behaviour and the
  * wrong place for it: it makes the tick untestable without moving the machine clock, which is why
  * the staleness check here takes a `Clock` and lives in `src/bots.ts` rather than in the engine.
  */

@@ -14,8 +14,8 @@
  * ═════════════════════════════════════════════════════════════════════════════════════════════════
  * INVARIANT 0 — ONE SETTLEMENT PER (BOT, PERIOD), ENFORCED BY THE DATABASE. **New.**
  *
- * The frozen row's identity is `randomUUID()` (`crucible/services/crucible/src/store.ts:452`) and its
- * upstream idempotency key is derived from that id (`crucible/services/crucible/src/clients/pay.ts:134`).
+ * The frozen row's identity is `randomUUID()` (`crucible/services/crucible/src/store.ts`) and its
+ * upstream idempotency key is derived from that id (`crucible/services/crucible/src/clients/pay.ts`).
  * Two attempts at the same settlement therefore produce two DIFFERENT keys, and the upstream
  * correctly honours both — `fee_settlements` has no unique constraint to catch it. That race is
  * live at one replica, between the hourly sweep and the stop route.
@@ -52,15 +52,15 @@
  *
  * ## This is the retry loop, and it is a real one
  *
- * `micro-org`'s inherited `MICROSERVICES.md:187` states "There are also **zero retries anywhere**"
+ * `micro-org`'s inherited `MICROSERVICES.md` states "There are also **zero retries anywhere**"
  * about the frozen estate. That claim is **false**, and the code it is false about is this file's
  * ancestor: `resolvePending` re-sends every undecided row under its original key on every pass, and
- * `settlementSweep` (`crucible/services/crucible/src/runner.ts:431-505`) drives it over both the
+ * `settlementSweep` (`crucible/services/crucible/src/runner.ts`) drives it over both the
  * running bots and the ones that have left the running set still owing something. The retry horizon
  * is unbounded by design, the `attempted` column exists specifically so a retry re-sends an
- * identical request (`crucible/services/crucible/src/db/migrate.ts:176-178`), and the stop route
+ * identical request (`crucible/services/crucible/src/db/migrate.ts`), and the stop route
  * says so in a comment ("the settlement sweep will retry it",
- * `crucible/services/crucible/src/routes/bots.ts:304-313`). What the frozen estate lacks is
+ * `crucible/services/crucible/src/routes/bots.ts`). What the frozen estate lacks is
  * *in-request* retry inside its HTTP client — a different and much smaller claim.
  */
 

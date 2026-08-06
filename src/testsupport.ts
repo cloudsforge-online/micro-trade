@@ -9,7 +9,7 @@
  * about what the NEXT pass does after a call whose answer never arrived. That is only testable
  * against a ledger that can commit a charge and lose the response. The frozen service reached the
  * same conclusion and injected its ports for the same reason
- * (`crucible/services/crucible/src/fees.ts:117-126`).
+ * (`crucible/services/crucible/src/fees.ts`).
  */
 
 import postgres from 'postgres'

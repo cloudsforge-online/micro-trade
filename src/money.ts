@@ -4,11 +4,11 @@
  * ## Why this file exists at all
  *
  * The service this supersedes declares every Shard column as `bigint` in its schema and then reads
- * every one of them into a JavaScript **number** (`crucible/services/crucible/src/db/schema.ts:66`
+ * every one of them into a JavaScript **number** (`crucible/services/crucible/src/db/schema.ts`
  * and following: `bigint('cash', { mode: 'number' })`). It then does its position sizing in floats
- * — `qty = notional / price` at `crucible/services/crucible/src/engine/backtest.ts:110` — and
+ * — `qty = notional / price` at `crucible/services/crucible/src/engine/backtest.ts` — and
  * stores the result as a decimal string parsed back with `Number()`
- * (`crucible/packages/contracts/src/index.ts:648-655). Every balance in that service is a float
+ * (`crucible/packages/contracts/src/index.ts). Every balance in that service is a float
  * wearing an integer's name.
  *
  * 04 §0: "Every fiat or Shard amount is a scaled integer. **No floats anywhere in money.**"
@@ -95,7 +95,7 @@ export function applyBpsUp(amount: bigint, bps: number): bigint {
  * The price a fill actually happens at, once slippage has moved it against the trader.
  *
  * Against, in both directions: a buyer pays more and a seller receives less. The frozen backtest
- * gets this right (`crucible/services/crucible/src/engine/backtest.ts:108` and `:126`) and it is
+ * gets this right (`crucible/services/crucible/src/engine/backtest.ts` and) and it is
  * the single easiest sign error to make, because getting it backwards makes every strategy look
  * profitable.
  */
@@ -134,7 +134,7 @@ export function equityOf(cash: bigint, units: bigint, asset: AssetCode, priceSca
 /**
  * The performance fee owed on a bot's equity, in whole Shards.
  *
- * Ported from `crucible/packages/contracts/src/index.ts:803-808`, in bigint, with the behaviour
+ * Ported from `crucible/packages/contracts/src/index.ts`, in bigint, with the behaviour
  * unchanged: it rounds DOWN, it returns zero when equity has not exceeded the high-water mark, and
  * it returns zero when the fee would fall under the floor. The floor exists because the accounting
  * costs more than the fee below it, and a settlement history full of one-Shard rows buries the ones

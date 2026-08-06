@@ -2,8 +2,8 @@
  * Backtests, as rows and as work.
  *
  * **The one behavioural change from the frozen service.** It runs a backtest inside the POST
- * (`crucible/services/crucible/src/routes/backtests.ts:30-128`) and argues the case in its own
- * comment at `:26-29`: "A thousand candles through ten indicators is single-digit milliseconds; the
+ * (`crucible/services/crucible/src/routes/backtests.ts`) and argues the case in its own
+ * comment: "A thousand candles through ten indicators is single-digit milliseconds; the
  * only slow part is the feed … A job queue here would buy nothing but a polling endpoint and a way
  * for a result to go missing."
  *

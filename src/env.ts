@@ -10,8 +10,8 @@
  *
  *   1. **`TRADE_LIVE_ENABLED` is read on every tick, not at boot.** The frozen service read its
  *      equivalent only when a bot was created and when one was started
- *      (`crucible/services/crucible/src/runner.ts:47-58` describes the fix; the switch is consulted
- *      in the tick loop at `runner.ts:388`). A kill switch that only applies to bots that do not
+ *      (`crucible/services/crucible/src/runner.ts` describes the fix; the switch is consulted
+ *      in the tick loop at `runner.ts`). A kill switch that only applies to bots that do not
  *      exist yet is not a kill switch. Here it is a field on a frozen object read per tick, which
  *      is the same property reached without a mutable global.
  *   2. **There is no market-feed credential and no exchange URL.** Candle data is not this
@@ -131,7 +131,7 @@ function boolean(source: Source, name: string, fallback: boolean): boolean {
  * refused — and the topic this service consumes on that hop is `identity.user.deleted`, so a silent
  * partition is an erasure obligation quietly not met.
  *
- * Copied from `devplatform/src/env.ts:103`, which took the shape from activity's
+ * Copied from `devplatform/src/env.ts`, which took the shape from activity's
  * `ACTIVITY_INGEST_SECRETS`. Each entry is validated exactly as the signing secret is, by the same
  * `@cloudsforge/secrets` gate: a list is not a way to smuggle in a value that would be refused on
  * its own. The list does NOT get a weaker rule because it is "just for the drain" — in an overlap
@@ -200,7 +200,7 @@ export interface Env {
    * Live bots do not trade and no fee is settled while this is off. It is deliberately not a status
    * change: the operator's intent is to stop money moving, not to unwind everyone's positions, and
    * a bot left running resumes the moment the switch goes back on. Ported from
-   * `crucible/services/crucible/src/runner.ts:47-58`.
+   * `crucible/services/crucible/src/runner.ts`.
    *
    * Defaults to **false**, and 17 §9 names that exact default as the reason Crucible's fee "is
    * complete, correct, well-designed and earns nothing". Built-and-off is the honest state; the
