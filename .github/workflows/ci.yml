@@ -21,7 +21,10 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # `release/**` builds too. A release branch carries the estate-wide version bump, and it
+    # has to publish its images before testnet can be deployed from it — which is what proves
+    # the release before anything is merged. Mainnet is unaffected: it pins a version tag.
+    branches: [main, 'release/**']
   pull_request:
 
 permissions:
