@@ -21,7 +21,10 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # `release/**` builds too. A release branch carries the estate-wide version bump, and it
+    # has to publish its images before testnet can be deployed from it — which is what proves
+    # the release before anything is merged. Mainnet is unaffected: it pins a version tag.
+    branches: [main, 'release/**']
   pull_request:
 
 permissions:
@@ -225,7 +228,9 @@ jobs:
     needs: [estate, migrate, rules, hygiene]
     # A green push to main and nothing else. An image tag a release manifest pins has to name
     # something that passed, on the branch it will be deployed from.
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: >-
+      github.event_name == 'push' && (github.ref == 'refs/heads/main' ||
+      startsWith(github.ref, 'refs/heads/release/'))
     uses: cloudsforge-online/micro-org/.github/workflows/publish-image.yml@main
     with:
       kind: service
