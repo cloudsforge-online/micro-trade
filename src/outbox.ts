@@ -105,25 +105,38 @@ export async function withOutbox<T>(
     const value = await fn(tx, (event) => {
       pending.push(event)
     })
-    for (const event of pending) {
-      await tx`
-        insert into outbox (topic, key, producer, version, actor, correlation_id, payload)
-        values (
-          ${event.topic},
-          ${event.key},
-          ${producer},
-          ${event.version ?? 1},
-          ${event.actor ?? null},
-          ${event.correlationId ?? null},
-          ${tx.json(event.payload as Record<string, never>)}
-        )
-      `
-    }
+    await flushEvents(tx, producer, pending)
     // Wrapped so postgres.js does not treat an array-shaped result as a list of promises to
     // unwrap, which would rewrite the caller's return type.
     return { value }
   })
   return outcome.value
+}
+
+/**
+ * Write collected events into the outbox on a transaction the caller owns.
+ *
+ * Exported because `withIdempotency` needs the same thing and cannot nest a second `withOutbox`
+ * inside its own transaction: the claim and the work have to commit together, so there is only one
+ * transaction to write into. Sharing the statement rather than copying it is what stops the two
+ * paths drifting on the columns or on the `version ?? 1` default — a drifted version column is the
+ * exact defect `src/topics.ts` was written about.
+ */
+export async function flushEvents(tx: Tx, producer: string, events: readonly DomainEvent[]): Promise<void> {
+  for (const event of events) {
+    await tx`
+      insert into outbox (topic, key, producer, version, actor, correlation_id, payload)
+      values (
+        ${event.topic},
+        ${event.key},
+        ${producer},
+        ${event.version ?? 1},
+        ${event.actor ?? null},
+        ${event.correlationId ?? null},
+        ${tx.json(event.payload as Record<string, never>)}
+      )
+    `
+  }
 }
 
 /* ------------------------------------------------------------------------ signing */

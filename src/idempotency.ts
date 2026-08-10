@@ -35,7 +35,7 @@
  */
 
 import { createHash } from 'node:crypto'
-import type { Db, Tx } from './outbox.ts'
+import { flushEvents, type DomainEvent, type Db, type Emit, type Tx } from './outbox.ts'
 
 /** The claim exists but its transaction has not committed a response yet. The caller retries. */
 export class IdempotencyInFlightError extends Error {
@@ -125,8 +125,14 @@ export interface IdempotencyInput<T> {
    * The work. Returns the response to store and, when the work created one, a urn naming what it
    * created — so the claim row points at the bot, fill or settlement and an operator can join a
    * key to the thing it produced.
+   *
+   * `emit` is the outbox, on this same transaction. It exists because the alternative — wrapping the
+   * work in `withOutbox` — opens a SECOND transaction inside this one, and then the claim and the
+   * events can commit apart: an event announcing an order that the claim rolled back, or a claim
+   * whose event never went. One transaction is the entire argument of this file, and the events
+   * belong inside it.
    */
-  readonly run: (tx: Tx, storedKey: string) => Promise<{ response: T; subjectUrn: string | null }>
+  readonly run: (tx: Tx, storedKey: string, emit: Emit) => Promise<{ response: T; subjectUrn: string | null }>
 }
 
 export async function withIdempotency<T>(sql: Db, input: IdempotencyInput<T>): Promise<IdempotentOutcome<T>> {
@@ -155,7 +161,14 @@ export async function withIdempotency<T>(sql: Db, input: IdempotencyInput<T>): P
       return { value: { result: existing.response as T, replayed: true } }
     }
 
-    const { response, subjectUrn } = await input.run(tx, key)
+    const pending: DomainEvent[] = []
+    const { response, subjectUrn } = await input.run(tx, key, (event) => {
+      pending.push(event)
+    })
+    // After the work and before the response is stored, so an event can only exist for work that is
+    // about to be answered for. `originatingService` is the producer by definition here: it is the
+    // service whose route is running.
+    await flushEvents(tx, input.originatingService, pending)
 
     await tx`
       update idempotency_keys

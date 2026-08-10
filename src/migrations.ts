@@ -420,6 +420,308 @@ export const MIGRATIONS: readonly Migration[] = [
         where status = 'pending';
     `,
   },
+  {
+    version: 10,
+    name: 'exchange',
+    // ────────────────────────────────────────────────────────────────────────────────────────────
+    // THE ORDER BOOK.
+    //
+    // Everything above this line is one customer trading against a price feed. Everything below it
+    // is customers trading against EACH OTHER, which is a different kind of system with a different
+    // set of ways to lose money, and the schema is where most of those are closed:
+    //
+    //   * `orders.sequence` is a `bigserial`, not a timestamp. Two orders accepted in the same
+    //     millisecond are routine and `now()` cannot rank them; `nextval` can. src/exchange.ts
+    //     draws it inside the market row's lock, so lock order is arrival order is match order.
+    //   * `trades_not_self` is self-trade prevention AS A DATABASE CONSTRAINT. The engine prevents
+    //     it and src/matching.test.ts proves the engine does, but a wash trade printed to a public
+    //     tape is the kind of defect that is discovered by a regulator, so it is also made
+    //     impossible to store.
+    //   * `exchange_accounts` splits every balance into `available` and `held`, both `>= 0`. An
+    //     open order's escrow lives in `held`, which is what makes "spend the same coin twice" a
+    //     constraint violation rather than a race you have to win.
+    //   * Every amount is `numeric(78,0)`. There is no float in this schema and there is no column
+    //     that could hold one.
+    //
+    // The exactness rule, `markets_notional_exact`, is the one worth reading twice. A fill's
+    // notional is `qty * price / 10^base_decimals`, and if that division is ever inexact the
+    // remainder is money that arrived nowhere. Because every quantity is a multiple of `lot_size`
+    // and every price a multiple of `tick_size`, requiring `(lot_size * tick_size)` to be a
+    // multiple of `10^base_decimals` makes every possible fill in the market exact. It is checked
+    // here rather than in application code because a market created by hand in psql would otherwise
+    // start losing fractions and nothing would say so.
+    // ────────────────────────────────────────────────────────────────────────────────────────────
+    up: `
+      create table if not exists markets (
+        id               uuid          primary key default gen_random_uuid(),
+        symbol           text          not null,
+        base_asset       text          not null,
+        quote_asset      text          not null,
+        base_decimals    integer       not null,
+        quote_decimals   integer       not null,
+        lot_size         numeric(78,0) not null,
+        tick_size        numeric(78,0) not null,
+        min_notional     numeric(78,0) not null,
+        maker_fee_bps    integer       not null default 10,
+        taker_fee_bps    integer       not null default 20,
+        -- active: everything. post_only: no taking, so a wide book can be rebuilt without anyone
+        -- being run over. cancel_only: no new orders, existing ones may be pulled. halted: nothing.
+        status           text          not null default 'active',
+        -- The price band, as basis points either side of reference_price. A market order's
+        -- protection price is derived from it, and a limit outside it is refused. This is the
+        -- fat-finger control; see src/exchange.ts.
+        band_bps         integer       not null default 2000,
+        reference_price  numeric(78,0),
+        last_price       numeric(78,0),
+        last_traded_at   timestamptz,
+        created_at       timestamptz   not null default now(),
+        updated_at       timestamptz   not null default now(),
+        constraint markets_symbol_uniq unique (symbol),
+        constraint markets_assets_differ check (base_asset <> quote_asset),
+        constraint markets_status_known check (status in ('active','post_only','cancel_only','halted')),
+        constraint markets_decimals_sane check (
+          base_decimals between 0 and 30 and quote_decimals between 0 and 30
+        ),
+        constraint markets_sizes_positive check (
+          lot_size > 0 and tick_size > 0 and min_notional >= 0
+        ),
+        constraint markets_fees_sane check (
+          maker_fee_bps between 0 and 1000 and taker_fee_bps between 0 and 1000
+        ),
+        constraint markets_band_sane check (band_bps between 1 and 10000),
+        constraint markets_prices_positive check (
+          (reference_price is null or reference_price > 0) and (last_price is null or last_price > 0)
+        ),
+        constraint markets_notional_exact check (
+          mod(lot_size * tick_size, power(10::numeric, base_decimals)) = 0
+        )
+      );
+
+      -- The custodial sub-ledger. One row per (customer, asset); the platform's fee income sits in
+      -- the same table under the all-zero user id, so that "does the exchange conserve value" is
+      -- one SUM over one table and not a reconciliation between two.
+      create table if not exists exchange_accounts (
+        user_id    uuid          not null,
+        asset      text          not null,
+        available  numeric(78,0) not null default 0,
+        held       numeric(78,0) not null default 0,
+        updated_at timestamptz   not null default now(),
+        primary key (user_id, asset),
+        constraint exchange_accounts_non_negative check (available >= 0 and held >= 0)
+      );
+
+      -- Money crossing the boundary between the customer's ledger balance and the exchange's
+      -- custody. These are the ONLY two operations that touch the ledger; a match moves nothing
+      -- outside this schema, which is what lets a match be a single local transaction.
+      create table if not exists exchange_transfers (
+        id         uuid          primary key default gen_random_uuid(),
+        user_id    uuid          not null,
+        asset      text          not null,
+        direction  text          not null,
+        amount     numeric(78,0) not null,
+        status     text          not null default 'pending',
+        entry_id   uuid,
+        error      text,
+        created_at timestamptz   not null default now(),
+        settled_at timestamptz,
+        constraint exchange_transfers_direction_known check (direction in ('deposit','withdrawal')),
+        constraint exchange_transfers_status_known check (
+          status in ('pending','settled','refused','unresolved')
+        ),
+        constraint exchange_transfers_amount_positive check (amount > 0),
+        constraint exchange_transfers_settled_has_entry check (status <> 'settled' or entry_id is not null)
+      );
+
+      create index if not exists exchange_transfers_user_idx
+        on exchange_transfers (user_id, created_at desc);
+      create index if not exists exchange_transfers_open_idx
+        on exchange_transfers (created_at)
+        where status in ('pending','unresolved');
+
+      create table if not exists orders (
+        id               uuid          primary key default gen_random_uuid(),
+        market_id        uuid          not null references markets (id) on delete restrict,
+        user_id          uuid          not null,
+        -- Arrival rank. See the header: this is price-TIME priority's time.
+        sequence         bigserial     not null,
+        -- The customer's own label, echoed back so they can reconcile without storing our ids.
+        client_order_id  text,
+        side             text          not null,
+        type             text          not null,
+        price            numeric(78,0),
+        stop_price       numeric(78,0),
+        tif              text          not null default 'gtc',
+        post_only        boolean       not null default false,
+        stp              text          not null default 'cancel_taker',
+        qty              numeric(78,0),
+        quote_qty        numeric(78,0),
+        -- A reserve order: only this much is published in the depth feed. The hidden remainder is
+        -- real liquidity and matches normally and does NOT lose its place in the queue, which is
+        -- what distinguishes it from a slice-refreshing iceberg. Said plainly in src/exchange.ts.
+        display_qty      numeric(78,0),
+        remaining        numeric(78,0) not null default 0,
+        filled_qty       numeric(78,0) not null default 0,
+        filled_quote_qty numeric(78,0) not null default 0,
+        fee_base         numeric(78,0) not null default 0,
+        fee_quote        numeric(78,0) not null default 0,
+        held_asset       text,
+        held_amount      numeric(78,0) not null default 0,
+        status           text          not null default 'open',
+        cancel_reason    text,
+        expires_at       timestamptz,
+        created_at       timestamptz   not null default now(),
+        updated_at       timestamptz   not null default now(),
+        constraint orders_side_known check (side in ('buy','sell')),
+        constraint orders_type_known check (type in ('limit','market','stop_limit','stop_market')),
+        constraint orders_tif_known check (tif in ('gtc','ioc','fok','gtd')),
+        constraint orders_stp_known check (
+          stp in ('cancel_taker','cancel_maker','cancel_both','decrement_and_cancel')
+        ),
+        constraint orders_status_known check (
+          status in ('pending_trigger','open','filled','cancelled','rejected','expired')
+        ),
+        constraint orders_amounts_non_negative check (
+          remaining >= 0 and filled_qty >= 0 and filled_quote_qty >= 0
+            and fee_base >= 0 and fee_quote >= 0 and held_amount >= 0
+            and (qty is null or qty > 0) and (quote_qty is null or quote_qty > 0)
+            and (display_qty is null or display_qty > 0)
+        ),
+        constraint orders_prices_positive check (
+          (price is null or price > 0) and (stop_price is null or stop_price > 0)
+        ),
+        -- A limit order without a price is not an order, and a market order with one is a limit
+        -- order that lied about its type.
+        constraint orders_limit_has_price check (
+          (type in ('limit','stop_limit')) = (price is not null)
+        ),
+        constraint orders_stop_has_trigger check (
+          (type in ('stop_limit','stop_market')) = (stop_price is not null)
+        ),
+        -- Exactly one of the two ways to size an order. A quote-driven order is a market buy and
+        -- nothing else; see the note on matchOrder in src/matching.ts about why a market buy sized
+        -- in base units cannot be escrowed honestly.
+        constraint orders_one_size check ((qty is null) <> (quote_qty is null)),
+        constraint orders_quote_only_market_buy check (
+          quote_qty is null or (side = 'buy' and type in ('market','stop_market'))
+        ),
+        constraint orders_gtd_has_expiry check ((tif = 'gtd') = (expires_at is not null)),
+        constraint orders_held_has_asset check (held_amount = 0 or held_asset is not null),
+        -- Nothing may still be reserved once an order has stopped being live. This is the
+        -- constraint that turns "we forgot to release the escrow" from a support ticket about a
+        -- missing balance into a failed transaction.
+        constraint orders_terminal_holds_nothing check (
+          status in ('pending_trigger','open') or held_amount = 0
+        )
+      );
+
+      -- THE BOOK READ. Partial on the live statuses, and ordered exactly as bookOrder in
+      -- src/matching.ts ranks: price then sequence. A plain index here would still answer, but
+      -- would make the hot path scan every terminal order the market has ever had.
+      create index if not exists orders_book_idx
+        on orders (market_id, side, price, sequence)
+        where status = 'open';
+      create index if not exists orders_user_idx on orders (user_id, created_at desc);
+      create index if not exists orders_user_open_idx
+        on orders (user_id, market_id)
+        where status in ('open','pending_trigger');
+      create index if not exists orders_trigger_idx
+        on orders (market_id, stop_price)
+        where status = 'pending_trigger';
+      create index if not exists orders_expiry_idx
+        on orders (expires_at)
+        where status = 'open' and expires_at is not null;
+      -- A client order id identifies ONE live order. Reusing it after that order is done is
+      -- allowed, which is why the index is partial: otherwise a customer's own numbering scheme
+      -- would run out.
+      create unique index if not exists orders_client_id_uniq
+        on orders (user_id, market_id, client_order_id)
+        where client_order_id is not null and status in ('open','pending_trigger');
+
+      create table if not exists trades (
+        id              uuid          primary key default gen_random_uuid(),
+        seq             bigserial     not null,
+        market_id       uuid          not null references markets (id) on delete restrict,
+        taker_order_id  uuid          not null references orders (id) on delete restrict,
+        maker_order_id  uuid          not null references orders (id) on delete restrict,
+        taker_user_id   uuid          not null,
+        maker_user_id   uuid          not null,
+        taker_side      text          not null,
+        price           numeric(78,0) not null,
+        qty             numeric(78,0) not null,
+        quote_qty       numeric(78,0) not null,
+        taker_fee       numeric(78,0) not null default 0,
+        maker_fee       numeric(78,0) not null default 0,
+        taker_fee_asset text          not null,
+        maker_fee_asset text          not null,
+        created_at      timestamptz   not null default now(),
+        constraint trades_side_known check (taker_side in ('buy','sell')),
+        constraint trades_fee_assets_known check (
+          taker_fee_asset in ('base','quote') and maker_fee_asset in ('base','quote')
+        ),
+        constraint trades_amounts_positive check (
+          price > 0 and qty > 0 and quote_qty > 0 and taker_fee >= 0 and maker_fee >= 0
+        ),
+        constraint trades_orders_differ check (taker_order_id <> maker_order_id),
+        -- Self-trade prevention, in the database. A tape that carries an account trading with
+        -- itself is a false volume figure, and a false volume figure is the thing a market
+        -- surveillance review looks for first.
+        constraint trades_not_self check (taker_user_id <> maker_user_id)
+      );
+
+      create index if not exists trades_market_idx on trades (market_id, seq desc);
+      create index if not exists trades_taker_idx on trades (taker_user_id, created_at desc);
+      create index if not exists trades_maker_idx on trades (maker_user_id, created_at desc);
+
+      -- The lifecycle, appended to and never rewritten. orders.status is where an order IS;
+      -- this is how it got there, which is the question a customer disputing a fill actually asks.
+      create table if not exists order_events (
+        id         uuid          primary key default gen_random_uuid(),
+        order_id   uuid          not null references orders (id) on delete cascade,
+        seq        bigserial     not null,
+        kind       text          not null,
+        qty        numeric(78,0) not null default 0,
+        price      numeric(78,0),
+        detail     text,
+        created_at timestamptz   not null default now(),
+        constraint order_events_kind_known check (
+          kind in ('accepted','triggered','filled','cancelled','rejected','expired','reduced')
+        )
+      );
+
+      create index if not exists order_events_order_idx on order_events (order_id, seq);
+
+      -- Rate limiting as a fixed window in the database rather than a counter in a process.
+      -- Two replicas sharing one limit is the requirement; a per-process counter silently doubles
+      -- every limit the moment the service scales, which is exactly when the limit matters.
+      create table if not exists rate_limits (
+        bucket       text        not null,
+        window_start timestamptz not null,
+        count        integer     not null default 0,
+        primary key (bucket, window_start),
+        constraint rate_limits_count_non_negative check (count >= 0)
+      );
+
+      create index if not exists rate_limits_window_idx on rate_limits (window_start);
+
+      -- The markets this estate lists, seeded so that a fresh deploy has a usable exchange rather
+      -- than an empty one waiting on a manual step. Reference data, not customer data: re-running
+      -- the migrator changes nothing, and an operator who has retuned a market keeps their tuning.
+      --
+      -- Every pair quotes in EMBER because SHARD is retired (contracts-chain RETIRED_ASSETS) and
+      -- EMBER is the estate's own issuable unit. Lot and tick are chosen so that
+      -- (lot * tick) mod 10^base_decimals = 0 -- markets_notional_exact refuses anything else.
+      insert into markets (symbol, base_asset, quote_asset, base_decimals, quote_decimals, lot_size, tick_size, min_notional)
+      values
+        ('BTC-EMBER',  'BTC',  'EMBER', 8,  18, 10000,               1000000000000, 10000000000000000),
+        ('ETH-EMBER',  'ETH',  'EMBER', 18, 18, 1000000000000000,    1000000000000, 10000000000000000),
+        ('LTC-EMBER',  'LTC',  'EMBER', 8,  18, 1000000,             1000000000000, 10000000000000000),
+        ('DOGE-EMBER', 'DOGE', 'EMBER', 8,  18, 100000000,           10000000000,   10000000000000000),
+        ('SOL-EMBER',  'SOL',  'EMBER', 9,  18, 10000000,            1000000000000, 10000000000000000),
+        ('XRP-EMBER',  'XRP',  'EMBER', 6,  18, 1000000,             1000000000000, 10000000000000000),
+        ('ETC-EMBER',  'ETC',  'EMBER', 18, 18, 10000000000000000,   1000000000000, 10000000000000000)
+      on conflict (symbol) do nothing;
+    `,
+  },
 ]
 
 /**
@@ -445,6 +747,13 @@ export const BASELINE_VERSION = 0
 
 /** Every table this service owns, for the test harness's truncate. Order is child-first. */
 export const TABLES: readonly string[] = Object.freeze([
+  'rate_limits',
+  'order_events',
+  'trades',
+  'orders',
+  'exchange_transfers',
+  'exchange_accounts',
+  'markets',
   'fee_settlements',
   'fills',
   'bots',

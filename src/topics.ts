@@ -32,18 +32,19 @@
  *      a real envelope through the relay's own `buildEnvelope` and hands it to the contract's own
  *      `classifyEnvelope`.
  *
- * ## One of the five is now registered; the other four are still quarantined
+ * ## One of the seven is now registered; the other six are still quarantined
  *
  * `trade` IS a valid `ProducerService` in the contract's union and, as of `micro-contracts`
  * `8889373`, owns exactly one topic in `TOPICS`: **`trade.bot.paused`**, adopted verbatim from the
- * entry that used to sit below. The other four still sit in the quarantine, each carrying the exact
- * `TopicSpec` `micro-contracts` should paste.
+ * entry that used to sit below. The other six still sit in the quarantine, each carrying the exact
+ * `TopicSpec` `micro-contracts` should paste — the last two of them added with the order book.
  *
  * That is still the reason `activity` files most trade events as `unclassified` — a bot a user
  * started, a fill they were charged for and a performance fee taken from their account are all
- * events nobody has named. The two that matter most are `trade.fill.settled` and
- * `trade.fee.settled`, because those are the two where money moves; `contracts/packages/events/
- * src/audit.ts` says so in the `trade.bot.paused` entry and commits to auditing them when they land.
+ * events nobody has named. The ones that matter most are `trade.fill.settled`, `trade.fee.settled`
+ * and now `trade.transfer.settled`, because those are the ones where money moves;
+ * `contracts/packages/events/src/audit.ts` says so in the `trade.bot.paused` entry and commits to
+ * auditing them when they land.
  *
  * The registration also changes what a mistake COSTS here. While every `trade.*` topic was
  * unregistered, `activity` took its unregistered-topic branch and quarantined without validating,
@@ -78,6 +79,8 @@ export const EMITTED_TOPICS = Object.freeze([
   'trade.bot.started',
   'trade.fee.settled',
   'trade.fill.settled',
+  'trade.order.filled',
+  'trade.transfer.settled',
 ] as const)
 
 export interface ProposedTopic {
@@ -150,6 +153,35 @@ export const AWAITING_REGISTRATION: Readonly<Record<string, ProposedTopic>> = Ob
       version: '1.0',
       keyedBy: 'settlement_id',
       description: 'A performance fee settlement completed for a bot period, with its entry.',
+    },
+  },
+  // The two below belong to the order book, which ships behind TRADE_EXCHANGE_ENABLED (see
+  // `src/env.ts` and R-54 in docs/ecosystem/16-risks-and-open-decisions.md). They are proposed
+  // anyway rather than held back until the flag goes on: a topic nobody has named is exactly the
+  // state that made every other `trade.*` event arrive at `activity` as `unclassified`, and the
+  // moment the flag IS turned on is the worst moment to discover the estate cannot read the events.
+  'trade.order.filled': {
+    reason:
+      "One order crossed the book and moved two customers' balances. Keyed by the TAKER order id rather than by the user, because an order is the aggregate a consumer follows and one order can fill against many makers in one pass — a per-trade topic would print an unbounded burst for a single customer action.",
+    spec: {
+      producer: 'trade',
+      payloadType: 'OrderFilled',
+      version: '1.0',
+      keyedBy: 'order_id',
+      description:
+        'An exchange order filled, wholly or partly, with the quantity and notional it traded.',
+    },
+  },
+  'trade.transfer.settled': {
+    reason:
+      "Money crossed the boundary between the user's wallet and their exchange balance, and it is the only trade event that corresponds to a ledger entry a consumer can reconcile against. Keyed by transfer id because that is the idempotency subject: one transfer, one journal entry, one event.",
+    spec: {
+      producer: 'trade',
+      payloadType: 'TransferSettled',
+      version: '1.0',
+      keyedBy: 'transfer_id',
+      description:
+        'A deposit into or withdrawal out of an exchange balance settled against the ledger.',
     },
   },
 })
