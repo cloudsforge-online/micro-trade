@@ -2,7 +2,9 @@
 
 [![ci](https://github.com/cloudsforge-online/micro-trade/actions/workflows/ci.yml/badge.svg)](https://github.com/cloudsforge-online/micro-trade/actions/workflows/ci.yml) [![TypeScript](https://img.shields.io/badge/TypeScript-strict%20ESM-3178C6?logo=typescript&logoColor=white)](./tsconfig.base.json) [![node](https://img.shields.io/badge/node-%3E%3D22-5FA04E?logo=nodedotjs&logoColor=white)](./package.json) [![tests](https://img.shields.io/badge/tests-real%20Postgres-4169E1?logo=postgresql&logoColor=white)](./.github/workflows/ci.yml) [![licence](https://img.shields.io/badge/licence-MIT-blue)](./LICENSE)
 
-Strategy catalogue, backtests, bots, fills, allocations, fee settlements and performance reporting.
+Strategy catalogue, backtests, bots, fills, allocations, fee settlements and performance reporting —
+and, behind `TRADE_EXCHANGE_ENABLED`, a **central limit order book**: price-time priority, escrowed
+orders, integer fees, self-trade prevention, an accurate ticker and a market-data surface.
 
 Design authority: [`ecosystem/03-repository-responsibilities.md`](https://github.com/cloudsforge-online/micro-docs/blob/main/ecosystem/03-repository-responsibilities.md)
 
@@ -14,7 +16,7 @@ around it that could not survive a second replica or a lost HTTP response.
 pnpm install
 pnpm migrate     # a one-shot job. Never run from the service.
 pnpm start
-pnpm check       # typecheck + 227 tests
+pnpm check       # typecheck + 382 tests
 ```
 
 ---
@@ -23,10 +25,10 @@ pnpm check       # typecheck + 227 tests
 
 | | |
 |---|---|
-| **Owns** | `series`, `bars`, `backtests`, `bots`, `fills`, `fee_settlements` |
+| **Owns** | `series`, `bars`, `backtests`, `bots`, `fills`, `fee_settlements`, and the order book: `markets`, `orders`, `order_events`, `trades`, `exchange_accounts`, `exchange_transfers`, `rate_limits` |
 | **Calls** | `ledger` (postings, reservations), `pricing` (marks and fill prices), `billing` (tier, soft) |
-| **Holds no** | balances. Every Shard of movement is a ledger entry whose id is on the row that caused it |
-| **Publishes** | `trade.bot.created`, `trade.bot.started`, `trade.bot.paused`, `trade.fill.settled`, `trade.fee.settled` |
+| **Holds no** | balances **for a bot**. Every Shard of a bot's movement is a ledger entry whose id is on the row that caused it. The exchange is the one exception and is custodial by necessity — see *The order book* below |
+| **Publishes** | `trade.bot.created`, `trade.bot.started`, `trade.bot.paused`, `trade.fill.settled`, `trade.fee.settled`, `trade.order.filled`, `trade.transfer.settled` |
 | **Consumes** | `identity.user.deleted` |
 
 Money is `bigint` everywhere. Prices are scaled integers — `RATE_SCALE` (10⁶) USD per whole unit —
@@ -102,6 +104,74 @@ Every path below is relative to `stack/repos/crucible/`, which is frozen and unm
   deployment and not of the caller. When live is off the body carries `LIVE_DISABLED`
   (`src/bots.ts`) **verbatim** — the same sentence the engine writes onto a bot it refuses — so
   a client's warning and the eventual refusal cannot say different things.
+
+
+---
+
+## The order book
+
+Migration 10 (`exchange`). Off by default behind `TRADE_EXCHANGE_ENABLED` — see the note on that
+variable in `src/env.ts`, and R-54 in `docs/ecosystem/16-risks-and-open-decisions.md`. The flag gates
+the **routes**; the jobs run either way, because switching an exchange off must not strand a
+good-till-date order or a withdrawal that has already debited somebody.
+
+### What was here before, and what a venue actually needs
+
+The service could convert **one customer's money against a price feed**. That is a broker, and every
+piece of it is real — a reservation at the ledger, a fill row, an exactly-once settlement. None of it
+is an exchange. Matching two customers against each other needs a different set of guarantees, and
+this is the list, honestly against what existed:
+
+| A real venue needs | Was there | Is there now |
+|---|---|---|
+| A market with a lot size, a tick size and a minimum notional | nothing — a bot named an asset and a price came from `pricing` | `markets`, with an `(lot × tick) % 10^base_decimals = 0` CHECK that makes `qty × price` exact |
+| A deterministic matching rule | — | `matching.ts`: price, then a `bigserial` `sequence` drawn under the market row lock. Pure and synchronous, so `matching.test.ts` runs it on literals |
+| Order types beyond market and limit | market only, and only as a bot's conversion | limit, market, stop-limit, stop-market; post-only; reserve (hidden-size) orders |
+| Time in force | — | `gtc`, `ioc`, `fok`, `gtd` (expired by a leased job) |
+| Escrow, so an order cannot be placed twice with one balance | the ledger reservation, per bot | `exchange_accounts.held`, taken **before** the row is inserted, at the order's own worst case |
+| Fees in integer minor units | performance fee only, in Shards | maker/taker basis points, charged in the asset each side **receives**, rounded down |
+| Self-trade prevention | not applicable | four modes, and a test that no mode can print a self-trade |
+| Order lifecycle a customer can audit | a bot's status | `order_events`, append-only: accepted, triggered, filled, reduced, cancelled, expired, rejected |
+| Cancellation, including a panic button | stop the bot | `DELETE /v1/exchange/orders/:id` and `POST /v1/exchange/orders/cancel-all`, the latter idempotent |
+| Depth, a ticker, candles, a tape | none — market data belongs to `micro-market` for *external* prices | derived from this venue's own `trades`, which is the one price series this repository does own |
+| Rate limits | none | fixed windows counted in Postgres, per authenticated subject and per action |
+| Idempotency on placement | on every other mutating route | the claim and the placement share **one** transaction (`placeOrderIn`) |
+| A price band | — | `markets.band_bps` against the last traded price, served in `marketView` so the browser's warning and the service's refusal are the same arithmetic |
+| An operator control for an incident | — | `active`, `post_only`, `cancel_only`, `halted` |
+
+### The three decisions worth arguing about
+
+- **The exchange is custodial, and that is a deliberate exception to "holds no balances".** A
+  matching engine that posted to the ledger per fill would make one trade a distributed transaction
+  across two services, and a burst of them a distributed transaction per fill. So the ledger is
+  touched at exactly two points — deposit and withdrawal, in `transfers.ts` — and everything between
+  them moves inside `exchange_accounts`. The ledger holds the total in one escrow account the whole
+  time, and the invariant that keeps the two honest is: **the sum of `available + held` across every
+  row of `exchange_accounts` for an asset equals what the ledger says is escrowed for it.**
+
+- **The fee is charged in the asset each side receives.** A buyer receives base and pays the taker
+  fee in base; a seller receives quote and pays the maker fee in quote. This is what makes the escrow
+  exact with **no fee term in it** — an order reserves precisely what it can spend, and the fee comes
+  out of what arrives. Charging the fee in the asset a side *spends* would mean every order had to
+  reserve a fee it might never owe, and every price improvement would have to refund part of it.
+
+- **Platform fee income is an ordinary row under the all-zero user id.** So conservation is one `SUM`
+  over one table, and `exchange.test.ts` asserts it before and after a randomised session. A separate
+  revenue table would have made "did matching create a unit" a join.
+
+### What is deliberately not here
+
+- **No cross-market routing, no synthetic pairs, no margin, no liquidation.** Every one of those is a
+  credit product, and none of them can be added by this service without a risk engine that does not
+  exist. An order can only ever spend what is already escrowed.
+- **No WebSocket.** Depth, the tape and the ticker are polled. A push feed is the right shape for a
+  trading screen and it is real work — a subscription registry, a per-connection backpressure policy,
+  and a replay cursor so a reconnect does not miss a print — and doing it badly is worse than
+  polling. The read routes are cheap and rate-limited; a feed can be added behind them without
+  changing any of this.
+- **No anonymous market data.** The tape is public in *content* and not in *access*: there is no
+  rate-limit subject for a caller with no principal, and depth and candles are the cheapest thing in
+  the world to put in a loop.
 
 ---
 
@@ -204,11 +274,20 @@ src/
   jobs.ts           every background timer, as a lease
   server.ts         routes, the error shape, the auth-fault mapping
   index.ts          the composition root, in order
+
+  markets.ts        a market's rules: lot, tick, min notional, fees, status, price band
+  accounts.ts       the custodial sub-ledger. available/held, both >= 0, and the conservation sum
+  orders.ts         the order row, its append-only event log, and the book as the engine wants it
+  matching.ts       THE ENGINE. Pure, synchronous, no database, no clock
+  exchange.ts       the engine's decisions, applied to a database inside one transaction
+  marketdata.ts     depth, ticker, candles, the public tape, and a customer's own fills
+  transfers.ts      the only two operations in the exchange that talk to the ledger
+  ratelimit.ts      fixed windows counted in Postgres, because a Map is per replica
 ```
 
 ## Tests
 
-`node:test` against a real Postgres. **227 tests, zero skipped.**
+`node:test` against a real Postgres. **382 tests, zero skipped.**
 
 ```
 TRADE_TEST_DATABASE_URL=postgres://…/trade_test pnpm test
@@ -231,6 +310,21 @@ The ones that carry the argument:
 | A stale price refuses the trade rather than defaulting | `bots.test.ts` |
 | Performance totals net to exactly zero over a hundred alternating trades | `unit.test.ts` |
 | Buying then valuing never manufactures a Shard | `unit.test.ts` |
+| Price-time priority, on literals, with the sequence as the only tiebreak | `matching.test.ts` |
+| A randomised trading session moves money and **never changes the total in custody** | `exchange.test.ts` |
+| A fill happens at the maker's price and the taker gets the improvement back immediately | `exchange.test.ts` |
+| Every recorded rejection — post-only, fill-or-kill, self-trade — returns the escrow in full | `exchange.test.ts` |
+| No self-trade-prevention mode can print a self-trade | `exchange.test.ts` |
+| A reserve order shows one lot and matches ten | `exchange.test.ts` |
+| A withdrawal whose outcome is unknown is **not** refunded, and settles under the same key later | `transfers.test.ts` |
+| A retried placement is a replay, and a key reused for a different order is a 409 | `server.test.ts` |
+| The panic button replays the **first** attempt's cancellation list, not an empty one | `server.test.ts` |
+
+A fifth was found the same way when the order book was added: `loadBook` mapped every open row's
+price through `amountFrom` **before** the caller filtered out the taker's own row — and a market
+order is inserted `open` with no price, so every market order placement failed with
+`RangeError: not an amount: object`. Nothing in `matching.test.ts` could have found it, because that
+suite never touches a table; the randomised session in `exchange.test.ts` found it on its first run.
 
 Four defects in this repository's own first draft were found by these tests rather than by review: a
 `fills_settled_has_entry` constraint that made every paper bot unable to fill, a

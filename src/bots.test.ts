@@ -408,6 +408,7 @@ function makeRunner(owner: string): { queue: JobQueue; runner: JobRunner; ran: s
       logger: quietLogger(),
       periodSeconds: 3_600,
     },
+    exchange: { clock, ledger },
   })
   return { queue, runner, ran }
 }

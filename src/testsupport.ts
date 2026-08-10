@@ -167,6 +167,14 @@ export interface FakeLedger extends LedgerClient {
   readonly keys: readonly string[]
   /** Shards the subject can spend. Charges above it are refused with `insufficient_funds`. */
   setBalance(userId: string, shards: bigint): void
+  /**
+   * The same thing for any subject and any asset, which is what the exchange's transfers need.
+   *
+   * A deposit debits `user:<id>` in the market's own asset and a withdrawal debits `exchange`, so
+   * neither is expressible as a shard balance. A subject/asset pair that has never been set is
+   * UNLIMITED, which is why adding this changes nothing for the tests that came before it.
+   */
+  setAssetBalance(subject: string, asset: string, amount: bigint): void
   /** Hide the balance entirely, as an outage does. `availableShards` then answers null. */
   hideBalance(hidden: boolean): void
   /**
@@ -194,16 +202,25 @@ export function fakeLedger(): FakeLedger {
   let inFlight = 0
   let sequence = 0
 
-  const spendOf = (postings: PostEntryRequest['postings'], subject: string): bigint => {
-    let total = 0n
+  /** `<subject>|<asset>`, the granularity a real ledger account has. */
+  const slot = (subject: string, asset: string): string => `${subject}|${asset}`
+
+  /**
+   * What one entry takes out of each account, by subject and asset.
+   *
+   * Every debit is counted, not just the ones on the subject that happens to appear first. The
+   * earlier version summed one subject's SHARD debits and nothing else, which meant a fake with a
+   * balance set could not refuse an entry that overdrew a different account in the same entry — and
+   * the exchange's withdrawals overdraw exactly such an account.
+   */
+  const debitsOf = (postings: PostEntryRequest['postings']): Map<string, bigint> => {
+    const spend = new Map<string, bigint>()
     for (const posting of postings) {
       if (posting.direction !== 'debit') continue
-      if (posting.assetCode !== 'SHARD') continue
-      if (posting.account.subject !== subject) continue
-      if (posting.account.purpose !== 'available') continue
-      total += posting.amount
+      const key = slot(posting.account.subject, posting.assetCode)
+      spend.set(key, (spend.get(key) ?? 0n) + posting.amount)
     }
-    return total
+    return spend
   }
 
   const commit = (request: PostEntryRequest): PostedEntry => {
@@ -223,7 +240,10 @@ export function fakeLedger(): FakeLedger {
     entries,
     keys,
     setBalance(userId, shards) {
-      balances.set(`user:${userId}`, shards)
+      balances.set(slot(`user:${userId}`, 'SHARD'), shards)
+    },
+    setAssetBalance(subject, asset, amount) {
+      balances.set(slot(subject, asset), amount)
     },
     hideBalance(value) {
       hidden = value
@@ -261,15 +281,31 @@ export function fakeLedger(): FakeLedger {
       const replay = byKey.get(request.idempotencyKey)
       if (replay) return { ...replay, replayed: true }
 
-      const subject = request.postings[0]?.account.subject ?? ''
-      const spend = spendOf(request.postings, subject)
-      const available = balances.get(subject)
-      if (available !== undefined && spend > available) {
-        // Refused on the balance. The claim rolls back with the posting, so the key is free again —
-        // which is what makes a smaller charge under the SAME key safe. See `collect` in fees.ts.
-        throw new LedgerRefusedError(409, 'insufficient_funds', `subject ${subject} cannot cover ${spend}`)
+      // Checked in full BEFORE anything is deducted, so a refusal leaves every balance untouched.
+      // Deducting as it went would half-apply an entry the ledger then refuses, and a fake that can
+      // leave a partial entry behind is a fake that can make a caller's retry look wrong.
+      const spend = debitsOf(request.postings)
+      for (const [key, amount] of spend) {
+        const available = balances.get(key)
+        if (available !== undefined && amount > available) {
+          // Refused on the balance. The claim rolls back with the posting, so the key is free again —
+          // which is what makes a smaller charge under the SAME key safe. See `collect` in fees.ts.
+          throw new LedgerRefusedError(409, 'insufficient_funds', `${key} cannot cover ${amount}`)
+        }
       }
-      if (available !== undefined) balances.set(subject, available - spend)
+      for (const [key, amount] of spend) {
+        const available = balances.get(key)
+        if (available !== undefined) balances.set(key, available - amount)
+      }
+      // Credits are applied to accounts a test has said it is tracking, and only those. Without this
+      // a deposit followed by a withdrawal would find the exchange's escrow no richer than it
+      // started, and the withdrawal would be refused for a reason that exists only in the fake.
+      for (const posting of request.postings) {
+        if (posting.direction !== 'credit') continue
+        const key = slot(posting.account.subject, posting.assetCode)
+        const held = balances.get(key)
+        if (held !== undefined) balances.set(key, held + posting.amount)
+      }
 
       const entry = commit(request)
       if (loseAnswer > 0) {
@@ -290,7 +326,7 @@ export function fakeLedger(): FakeLedger {
         failures -= 1
         throw new LedgerUnavailableError('the ledger is unreachable')
       }
-      const available = balances.get(request.subject)
+      const available = balances.get(slot(request.subject, request.assetCode))
       if (available !== undefined && request.amount > available) {
         throw new LedgerRefusedError(409, 'insufficient_funds', 'cannot reserve more than is available')
       }
@@ -319,7 +355,7 @@ export function fakeLedger(): FakeLedger {
 
     async availableShards(userId) {
       if (hidden) return null
-      return balances.get(`user:${userId}`) ?? null
+      return balances.get(slot(`user:${userId}`, 'SHARD')) ?? null
     },
   }
 }
@@ -407,6 +443,94 @@ export function makeBars(options: {
     bars.push({ t: startT + i * width, o: open, h: high, l: low, c: close, v: BigInt(i + 1) * RATE_SCALE })
   }
   return bars
+}
+
+/* ------------------------------------------------------------------ the exchange */
+
+/**
+ * A market with small, round rules, for tests that are about matching rather than about decimals.
+ *
+ * `lotSize * tickSize` is a multiple of `10 ** baseDecimals` by construction, which is the
+ * `markets_notional_exact` CHECK. That invariant is what makes `qty * price / baseUnit` exact, so a
+ * fixture that broke it would make every fill in the suite throw `RangeError` instead of testing
+ * anything — hence the defaults, and hence this note on the one field an overriding test is most
+ * likely to change.
+ *
+ * The symbol is made unique per call, because these tests run against one database and a market is
+ * unique on its symbol.
+ */
+export interface SeedMarketOptions {
+  readonly symbol?: string
+  readonly baseAsset?: string
+  readonly quoteAsset?: string
+  readonly baseDecimals?: number
+  readonly quoteDecimals?: number
+  readonly lotSize?: bigint
+  readonly tickSize?: bigint
+  readonly minNotional?: bigint
+  readonly makerFeeBps?: number
+  readonly takerFeeBps?: number
+  readonly status?: string
+  readonly bandBps?: number
+}
+
+let marketCounter = 0
+
+export async function seedMarket(sql: Db, options: SeedMarketOptions = {}): Promise<string> {
+  marketCounter += 1
+  const symbol = options.symbol ?? `TST${marketCounter}-EMBER`
+  const rows = await sql<{ id: string }[]>`
+    insert into markets (
+      symbol, base_asset, quote_asset, base_decimals, quote_decimals,
+      lot_size, tick_size, min_notional, maker_fee_bps, taker_fee_bps, status, band_bps
+    ) values (
+      ${symbol},
+      ${options.baseAsset ?? 'BTC'},
+      ${options.quoteAsset ?? 'EMBER'},
+      ${options.baseDecimals ?? 8},
+      ${options.quoteDecimals ?? 18},
+      ${(options.lotSize ?? 100_000n).toString()}::numeric,
+      ${(options.tickSize ?? 1_000_000_000_000n).toString()}::numeric,
+      ${(options.minNotional ?? 0n).toString()}::numeric,
+      ${options.makerFeeBps ?? 0},
+      ${options.takerFeeBps ?? 0},
+      ${options.status ?? 'active'},
+      ${options.bandBps ?? 10_000}
+    )
+    returning id
+  `
+  const id = rows[0]?.id
+  if (!id) throw new Error('market insert returned no row')
+  return id
+}
+
+/** Put spendable balance in a user's exchange account, the way a settled deposit would. */
+export async function seedBalance(
+  sql: Db,
+  userId: string,
+  asset: string,
+  available: bigint,
+): Promise<void> {
+  await sql`
+    insert into exchange_accounts (user_id, asset, available, held)
+    values (${userId}, ${asset}, ${available.toString()}::numeric, 0)
+    on conflict (user_id, asset)
+      do update set available = exchange_accounts.available + excluded.available, updated_at = now()
+  `
+}
+
+/**
+ * Every unit of an asset the exchange is holding, across every account including the platform's.
+ *
+ * The conservation invariant is one SUM over one table precisely so that a test can state it in one
+ * line: matching moves money between rows and must never change this number.
+ */
+export async function assetInCustody(sql: Db, asset: string): Promise<bigint> {
+  const rows = await sql<{ total: string | null }[]>`
+    select sum(available + held) as total from exchange_accounts where asset = ${asset}
+  `
+  const total = rows[0]?.total
+  return total === null || total === undefined ? 0n : BigInt(total)
 }
 
 /** Insert a series and its bars, returning the series id. */

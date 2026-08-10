@@ -16,8 +16,8 @@
  *      own `classifyEnvelope`.
  *
  * NOTE that the registry names exactly ONE `trade.*` topic — `trade.bot.paused`, adopted by
- * `micro-contracts` `8889373` — and the other four are still quarantined. So the envelope check
- * would pass vacuously for four of five if the quarantine excused everything. It does not:
+ * `micro-contracts` `8889373` — and the other six are still quarantined. So the envelope check
+ * would pass vacuously for six of seven if the quarantine excused everything. It does not:
  * `envelopeDefects excuses a lagging registry and nothing else` proves a real defect is still
  * reported on a quarantined topic.
  *
@@ -162,15 +162,18 @@ test('a pending proposal disappears once contracts adopts it', () => {
     'an emitted topic is registered or quarantined — this says it is neither, or counted twice',
   )
   // And the split itself, pinned, so moving a topic across the line is a deliberate edit here.
-  // `trade.bot.paused` is the one contracts has adopted (micro-contracts 8889373); the four that
-  // remain include `trade.fill.settled` and `trade.fee.settled`, which are the two where money
-  // moves and the two `contracts/packages/events/src/audit.ts` commits to auditing when they land.
+  // `trade.bot.paused` is the one contracts has adopted (micro-contracts 8889373); the six that
+  // remain include `trade.fill.settled`, `trade.fee.settled` and `trade.transfer.settled`, which
+  // are the ones where money moves and the ones `contracts/packages/events/src/audit.ts` commits
+  // to auditing when they land.
   assert.deepEqual(topicsProducedBy(SERVICE), ['trade.bot.paused'])
   assert.deepEqual(Object.keys(AWAITING_REGISTRATION).sort(), [
     'trade.bot.created',
     'trade.bot.started',
     'trade.fee.settled',
     'trade.fill.settled',
+    'trade.order.filled',
+    'trade.transfer.settled',
   ])
 })
 

@@ -207,6 +207,23 @@ export interface Env {
    * enabling condition is a deploy that sets this to true.
    */
   readonly liveEnabled: boolean
+  /**
+   * The order book, off by default.
+   *
+   * The exchange is a DIFFERENT REGULATORY OBJECT from everything else this service does. A
+   * backtest is a simulation, a bot converts one customer's money against a price feed, and both
+   * are things this estate already does. Matching two customers' orders against each other is
+   * operating a trading venue, and `docs/ecosystem/16-risks-and-open-decisions.md` R-54 names
+   * exactly that — "any proposal to match two users' conversions" — as the early warning that the
+   * unlicensed-exchange risk has been crossed.
+   *
+   * So it is built, tested, and shipped OFF. `GET /v1/capabilities` reports the flag, every
+   * exchange route answers 503 while it is false, and turning it on is a deliberate, recorded act
+   * by somebody who has answered the question R-54 asks. That is the same shape as
+   * `TRADE_LIVE_ENABLED` and for a related reason: the code being correct is not the same fact as
+   * the business being permitted to run it.
+   */
+  readonly exchangeEnabled: boolean
   /** `fast-read` profile from 07 §2. Applies to pricing and billing. */
   readonly upstreamDeadlineMs: number
   /** `money-write` profile from 07 §2. Applies to the ledger. No automatic retry at that budget. */
@@ -261,6 +278,7 @@ export function loadEnv(source: Source = process.env, host = ''): Env {
     billingUrl: required(source, 'BILLING_URL'),
     serviceToken: requiredSecret(source, 'TRADE_SERVICE_TOKEN'),
     liveEnabled: boolean(source, 'TRADE_LIVE_ENABLED', false),
+    exchangeEnabled: boolean(source, 'TRADE_EXCHANGE_ENABLED', false),
     upstreamDeadlineMs: integer(source, 'TRADE_UPSTREAM_DEADLINE_MS', 800, 100, 30_000),
     moneyDeadlineMs: integer(source, 'TRADE_MONEY_DEADLINE_MS', 5_000, 500, 60_000),
     settlementPeriodSeconds: integer(source, 'TRADE_SETTLEMENT_PERIOD_SECONDS', 3_600, 60, 86_400),

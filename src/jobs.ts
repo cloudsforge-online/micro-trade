@@ -26,11 +26,36 @@
  *   |                 |                    | key too, and 14 §5 makes it a mandatory test.           |
  *   | backtest.run    | `backtest:<id>`    | Two runs racing to write one `result_digest`.           |
  *   | idempotency.reap| `stream`           | Two long DELETEs contending on the same rows.           |
+ *   | exchange.maintain.sweep | `stream`   | Enqueue every market twice — deduped by the key below,  |
+ *   |                 |                    | so wasteful rather than wrong.                          |
+ *   | exchange.maintain | `market:<id>`    | **The market row lock.** Two of them serialise behind   |
+ *   |                 |                    | it and the second finds nothing to do, so this key buys |
+ *   |                 |                    | throughput rather than safety — the safety is the lock. |
+ *   | exchange.transfer.sweep | `stream`   | As above.                                               |
+ *   | exchange.transfer | `transfer:<id>`  | Two ledger posts for one transfer. The derived key      |
+ *   |                 |                    | makes the second a replay, so again wasteful not wrong. |
+ *   | ratelimit.reap  | `stream`           | Two long DELETEs contending on the same rows.           |
  *
  * Note `bot.settle`'s key carries the period. That is not decoration: `(kind, key)` is unique, so
  * within one period the sweep can enqueue as often as it likes and exactly one settlement job
  * exists. It is the same fact `fee_settlements_bot_period_uniq` states in the schema, arranged so
  * the second attempt never even starts rather than merely failing safely.
+ *
+ * A `stream` key is this file's word for "there is exactly one of these". `(kind, key)` is unique
+ * and the kind is half of it, so two different singletons keyed `stream` are still two rows; the
+ * key only has work to do where a kind has many instances.
+ *
+ * ## The exchange jobs run whether or not the exchange is enabled
+ *
+ * `TRADE_EXCHANGE_ENABLED` gates the ROUTES — whether new orders and new transfers are accepted. It
+ * deliberately does not gate the two jobs below, because the case that matters is the flag being
+ * turned OFF: at that moment there can be a good-till-date order that still has to expire and a
+ * withdrawal that has already debited a customer's balance and not yet reached the ledger. A flag
+ * that stopped maintenance would strand both, and the second one is somebody's money. Turning the
+ * exchange off stops it taking on new obligations; it does not abandon the ones it has.
+ *
+ * On a deployment that has never had the flag on both sweeps are two indexed queries against empty
+ * tables, which is the price of that property and is not worth optimising away.
  */
 
 import { JobRunner, type Job, type JobQueue, type RunnerEvent } from '@cloudsforge/jobs'
@@ -41,6 +66,12 @@ import { getBot, runningBotIds, tickBot, unsettledBotIds, type TickDeps } from '
 import { getSeries } from './series.ts'
 import { periodFor, settle, type FeeDeps } from './fees.ts'
 import { runBacktest } from './backtests.ts'
+import { maintainMarket } from './exchange.ts'
+import { marketsNeedingMaintenance } from './orders.ts'
+import { getTransferById, openTransfers, settleTransfer } from './transfers.ts'
+import { reapRateLimits } from './ratelimit.ts'
+import type { LedgerClient } from './ledgerclient.ts'
+import type { Clock } from './rng.ts'
 
 export const RELAY_KIND = 'outbox.relay'
 export const TICK_SWEEP_KIND = 'bot.tick.sweep'
@@ -49,9 +80,22 @@ export const SETTLE_SWEEP_KIND = 'bot.settle.sweep'
 export const SETTLE_KIND = 'bot.settle'
 export const BACKTEST_KIND = 'backtest.run'
 export const REAP_KIND = 'idempotency.reap'
+export const MAINTAIN_SWEEP_KIND = 'exchange.maintain.sweep'
+export const MAINTAIN_KIND = 'exchange.maintain'
+export const TRANSFER_SWEEP_KIND = 'exchange.transfer.sweep'
+export const TRANSFER_KIND = 'exchange.transfer'
+export const RATE_REAP_KIND = 'ratelimit.reap'
 
 /** Bots one sweep pass will enqueue. A ceiling, so one pass cannot become an unbounded transaction. */
 const SWEEP_LIMIT = 500
+
+/**
+ * How long a transfer is left to the request that booked it before the sweep picks it up.
+ *
+ * Longer than `TRADE_MONEY_DEADLINE_MS` (5s by default) plus the time it takes to apply the outcome,
+ * so a request that is merely slow is not raced by the job that exists for requests that DIED.
+ */
+const TRANSFER_ADOPTION_MS = 30_000
 
 export interface Recurring {
   readonly kind: string
@@ -71,6 +115,14 @@ export const RECURRING: readonly Recurring[] = Object.freeze([
   { kind: TICK_SWEEP_KIND, key: 'stream', everyMs: 5_000 },
   { kind: SETTLE_SWEEP_KIND, key: 'stream', everyMs: 60_000 },
   { kind: REAP_KIND, key: 'stream', everyMs: 86_400_000 },
+  // Five seconds is the resolution of a good-till-date expiry and of a stop that only the last trade
+  // in a market can fire. Both are promises to a customer about a price, so the interval is the
+  // worst case for how late either can be, and it is chosen against that rather than against load.
+  { kind: MAINTAIN_SWEEP_KIND, key: 'stream', everyMs: 5_000 },
+  { kind: TRANSFER_SWEEP_KIND, key: 'stream', everyMs: 30_000 },
+  // Every window this deletes has been closed for at least five minutes, so nothing is urgent; the
+  // interval is set by how big the table is allowed to get between passes, not by correctness.
+  { kind: RATE_REAP_KIND, key: 'stream', everyMs: 300_000 },
 ])
 
 /** Enqueue the recurring set at boot. `keep` means N replicas booting together produce one row. */
@@ -119,6 +171,18 @@ export interface JobDeps {
   readonly tick: Omit<TickDeps, 'correlationId'>
   /** Everything a settlement needs, minus the per-job correlation id. */
   readonly fees: Omit<FeeDeps, 'correlationId'>
+  /**
+   * What the order book's maintenance needs.
+   *
+   * Its own pair rather than a reach into `fees`, even though both hold the same two objects today.
+   * `fees.clock` is the clock a performance-fee PERIOD is computed against; sharing it here would
+   * make a test that freezes one of them silently freeze the other, which is the kind of coupling
+   * that is discovered by a test that cannot be made to fail.
+   */
+  readonly exchange: {
+    readonly clock: Clock
+    readonly ledger: LedgerClient
+  }
 }
 
 export function registerHandlers(runner: JobRunner, deps: JobDeps): JobRunner {
@@ -236,6 +300,122 @@ export function registerHandlers(runner: JobRunner, deps: JobDeps): JobRunner {
   runner.register(REAP_KIND, async () => {
     const removed = await reapIdempotencyKeys(deps.sql, deps.idempotencyTtlDays)
     if (removed > 0) deps.logger.info('reaped idempotency keys', { removed })
+  })
+
+  /* ---------------------------------------------------------------- the order book */
+
+  /**
+   * The maintenance producer.
+   *
+   * It asks the ORDERS table which markets have work rather than enqueuing every market, so on a
+   * quiet exchange this pass costs one indexed query and enqueues nothing. The alternative — one job
+   * per market every five seconds — takes and releases seven market locks a minute to discover there
+   * is nothing to do, and gets worse with every symbol listed.
+   */
+  runner.register(MAINTAIN_SWEEP_KIND, async (_job, ctx) => {
+    const due = await marketsNeedingMaintenance(
+      deps.sql,
+      new Date(deps.exchange.clock.now()),
+      SWEEP_LIMIT,
+    )
+    for (const marketId of due) {
+      if (ctx.signal.aborted) return
+      await deps.queue.enqueue({
+        kind: MAINTAIN_KIND,
+        key: `market:${marketId}`,
+        payload: { marketId },
+        onConflict: 'keep',
+      })
+    }
+  })
+
+  /**
+   * Expire what has timed out and fire what the market has moved past.
+   *
+   * This is the GUARANTEE behind both, not the usual path: a stop is normally promoted synchronously
+   * by the trade that moved the price past it, inside the same transaction and under the same lock.
+   * That path is bounded (`MAX_TRIGGER_ROUNDS`), and it is also unreachable in the one case that
+   * matters most — a market whose last trade fired a stop and then had no further trades at all.
+   * Without this job that stop waits for a stranger to place an order.
+   */
+  runner.register<{ marketId?: string }>(MAINTAIN_KIND, async (job, ctx) => {
+    const marketId = job.payload.marketId
+    if (typeof marketId !== 'string' || marketId.length === 0) {
+      throw new Error(`${MAINTAIN_KIND} requires a string marketId`)
+    }
+    if (ctx.signal.aborted) return
+    const outcome = await maintainMarket(
+      { sql: deps.sql, clock: deps.exchange.clock },
+      marketId,
+    )
+    if (outcome.expired > 0 || outcome.triggered > 0) {
+      deps.logger.info('market maintained', { marketId, ...outcome })
+    }
+  })
+
+  /**
+   * The transfer producer.
+   *
+   * Every transfer here is one a request abandoned — the process died between booking the row and
+   * hearing back from the ledger, or the ledger's answer was unknown. Both leave real money in a
+   * state nobody has resolved: a deposit whose wallet may already be debited, or a withdrawal whose
+   * exchange balance certainly is. The sweep is the only thing that finishes them.
+   */
+  runner.register(TRANSFER_SWEEP_KIND, async (_job, ctx) => {
+    const olderThan = new Date(deps.exchange.clock.now() - TRANSFER_ADOPTION_MS)
+    for (const transfer of await openTransfers(deps.sql, olderThan, SWEEP_LIMIT)) {
+      if (ctx.signal.aborted) return
+      await deps.queue.enqueue({
+        kind: TRANSFER_KIND,
+        key: `transfer:${transfer.id}`,
+        payload: { transferId: transfer.id },
+        onConflict: 'keep',
+      })
+    }
+  })
+
+  /**
+   * Ask the ledger about one transfer again.
+   *
+   * `settleTransfer` is safe to call any number of times for one row: the ledger idempotency key is
+   * derived from the row's id so a repeat replays the same entry rather than moving money twice, and
+   * the apply is a conditional UPDATE so the second caller claims nothing. That is what makes this a
+   * retry rather than a second transfer, and it is the whole reason the row is written before the
+   * ledger is called.
+   *
+   * A row that has since settled or been refused is re-read as terminal and skipped, which is the
+   * normal outcome when the request that booked it finished a moment after the sweep saw it.
+   */
+  runner.register<{ transferId?: string }>(TRANSFER_KIND, async (job, ctx) => {
+    const transferId = job.payload.transferId
+    if (typeof transferId !== 'string' || transferId.length === 0) {
+      throw new Error(`${TRANSFER_KIND} requires a string transferId`)
+    }
+    const transfer = await getTransferById(deps.sql, transferId)
+    if (!transfer) return
+    if (transfer.status !== 'pending' && transfer.status !== 'unresolved') return
+    if (ctx.signal.aborted) return
+    const outcome = await settleTransfer(
+      { sql: deps.sql, ledger: deps.exchange.ledger, correlationId: `job:${job.id}` },
+      transfer,
+    )
+    // `unresolved` repeating is the one state that can go on for ever, and it is the state in which
+    // a customer's withdrawal is debited and not paid. It has to be visible from the log rather than
+    // only from the row, because nobody queries a table they do not know to look at.
+    if (outcome.status === 'unresolved') {
+      deps.logger.warn('transfer is still unresolved — the ledger has not given an answer', {
+        transferId,
+        direction: transfer.direction,
+        asset: transfer.asset,
+      })
+    } else {
+      deps.logger.info('transfer resolved by the sweep', { transferId, status: outcome.status })
+    }
+  })
+
+  runner.register(RATE_REAP_KIND, async () => {
+    const removed = await reapRateLimits(deps.sql, deps.exchange.clock.now())
+    if (removed > 0) deps.logger.info('reaped rate-limit windows', { removed })
   })
 
   return runner

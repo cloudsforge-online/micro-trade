@@ -155,6 +155,9 @@ const server = createServer({
   pricing,
   clock: systemClock,
   liveEnabled: env.liveEnabled,
+  // Gates the `/v1/exchange` ROUTES only. The jobs below run either way — see the header of
+  // `src/jobs.ts` for why turning the book off must not strand a GTD order or a debited withdrawal.
+  exchangeEnabled: env.exchangeEnabled,
   settlementPeriodSeconds: env.settlementPeriodSeconds,
   // Signing stays singular (the relay below); ACCEPTING is a list, so the estate's shared secret
   // can be rotated with an overlap window instead of a flag day. Unset, this is exactly
@@ -217,6 +220,10 @@ registerHandlers(runner, {
     logger: logger.child({ job: 'bot.settle' }),
     periodSeconds: env.settlementPeriodSeconds,
   },
+  // Not gated on `env.exchangeEnabled`, deliberately — see the header of `src/jobs.ts`. The flag
+  // stops the exchange ACCEPTING work; maintenance of work it has already accepted must survive
+  // being switched off, or a withdrawal that debited a customer stays debited and unpaid.
+  exchange: { clock: systemClock, ledger },
 })
 await seedRecurring(queue)
 runner.start()

@@ -32,6 +32,8 @@ import {
   openDb,
   quietLogger,
   resetTrade,
+  seedBalance,
+  seedMarket,
   seedSeries,
   skip,
   testClock,
@@ -105,6 +107,7 @@ before(async () => {
       return clock
     },
     liveEnabled: true,
+    exchangeEnabled: true,
     settlementPeriodSeconds: 3_600,
     get eventAcceptSecrets() {
       return acceptSecrets
@@ -710,4 +713,381 @@ test('an oversized body is refused part-way through, and the connection is not r
 
 test('an id that is not a uuid is a 400 rather than a database error', { skip }, async () => {
   assert.equal((await call('/v1/bots/not-a-uuid', { token: 'alice' })).status, 400)
+})
+
+/* ------------------------------------------------------------------ the exchange */
+
+/**
+ * The order book over HTTP.
+ *
+ * `src/exchange.test.ts` proves the engine and `src/matching.test.ts` proves the ranking. What is
+ * left for this file is everything between the socket and those: who is allowed to ask, what a
+ * refusal looks like on the wire, that a retried placement is a replay and not a second order, and
+ * that money leaves the process as a decimal string and never as a JSON number.
+ */
+
+const LOT = 100_000n
+const TICK = 1_000_000_000_000n
+const TEN_LOTS = LOT * 10n
+const PRICE = TICK * 2n
+/** `qty * price / 10^8` for the seeded market's decimals. Exact by the notional CHECK. */
+const NOTIONAL = (TEN_LOTS * PRICE) / 100_000_000n
+
+async function seedExchange(): Promise<{ id: string; symbol: string }> {
+  const id = await seedMarket(db)
+  const rows = await sql<{ symbol: string }[]>`select symbol from markets where id = ${id}`
+  await seedBalance(db, ALICE, 'EMBER', 1_000_000_000_000n)
+  await seedBalance(db, ALICE, 'BTC', TEN_LOTS * 10n)
+  await seedBalance(db, BOB, 'EMBER', 1_000_000_000_000n)
+  await seedBalance(db, BOB, 'BTC', TEN_LOTS * 10n)
+  return { id, symbol: rows[0]?.symbol as string }
+}
+
+const orderBody = (symbol: string, over: Record<string, unknown> = {}) => ({
+  symbol,
+  side: 'buy',
+  type: 'limit',
+  price: PRICE.toString(),
+  qty: TEN_LOTS.toString(),
+  ...over,
+})
+
+test('capabilities names every order type and time-in-force the book accepts', { skip }, async () => {
+  const response = await call('/v1/capabilities')
+  assert.equal(response.status, 200)
+  const book = response.body.capabilities.orderBook
+  assert.equal(book.enabled, true)
+  // The browser builds its order ticket from this rather than from a second hardcoded list, so a
+  // type added to the engine and not to this response is a type no customer can reach.
+  assert.deepEqual(book.orderTypes, ['limit', 'market', 'stop_limit', 'stop_market'])
+  assert.ok(book.timeInForce.includes('gtd'))
+  assert.ok(book.stpModes.includes('cancel_taker'))
+  assert.ok(book.candleIntervals.includes('1m'))
+})
+
+test('the exchange tape is public in content but not in access', { skip }, async () => {
+  const { symbol } = await seedExchange()
+  // Anonymous is 401, not 200. There is no rate-limit subject for a caller with no principal, and
+  // the depth and candle routes are the cheapest thing in the world to put in a loop.
+  assert.equal((await call(`/v1/exchange/markets/${symbol}/depth`)).status, 401)
+  assert.equal((await call(`/v1/exchange/markets/${symbol}/depth`, { token: 'alice' })).status, 200)
+})
+
+test('a market can be named by symbol or by id, and an unknown one is a 404', { skip }, async () => {
+  const { id, symbol } = await seedExchange()
+  const bySymbol = await call(`/v1/exchange/markets/${symbol}`, { token: 'alice' })
+  const byId = await call(`/v1/exchange/markets/${id}`, { token: 'alice' })
+  assert.equal(bySymbol.status, 200)
+  assert.deepEqual(bySymbol.body.market, byId.body.market)
+  // One call draws the whole screen: the rules, the band, the top of book and the day.
+  assert.equal(bySymbol.body.market.lotSize, LOT.toString())
+  assert.deepEqual(bySymbol.body.bbo, { bid: null, ask: null })
+  assert.equal(bySymbol.body.ticker.trades, 0)
+  assert.equal(bySymbol.body.market.band, null, 'a market that has never traded has no band')
+
+  assert.equal((await call('/v1/exchange/markets/NOPE-EMBER', { token: 'alice' })).status, 404)
+})
+
+test('placing an order holds the money and reports it in minor units as a string', { skip }, async () => {
+  const { symbol } = await seedExchange()
+  const response = await call('/v1/exchange/orders', {
+    method: 'POST',
+    token: 'alice',
+    body: orderBody(symbol),
+  })
+  assert.equal(response.status, 201, JSON.stringify(response.body))
+  assert.equal(response.body.order.status, 'open')
+  assert.equal(response.body.order.heldAmount, NOTIONAL.toString())
+  assert.equal(typeof response.body.order.heldAmount, 'string')
+  // A bigserial rounded by a JSON number would silently reorder the book at scale.
+  assert.equal(typeof response.body.order.sequence, 'string')
+  assert.deepEqual(response.body.fills, [])
+
+  const balances = await call('/v1/exchange/balances', { token: 'alice' })
+  const ember = balances.body.balances.find((b: any) => b.asset === 'EMBER')
+  assert.equal(ember.held, NOTIONAL.toString())
+  assert.equal(ember.total, '1000000000000')
+})
+
+test('a retried placement is a replay, not a second order', { skip }, async () => {
+  const { symbol } = await seedExchange()
+  const key = freshKey('order')
+  const first = await call('/v1/exchange/orders', { method: 'POST', token: 'alice', key, body: orderBody(symbol) })
+  const second = await call('/v1/exchange/orders', { method: 'POST', token: 'alice', key, body: orderBody(symbol) })
+
+  assert.equal(first.status, 201)
+  assert.equal(second.status, 200, 'a replay is 200; only the first placement is a 201')
+  assert.equal(second.body.order.id, first.body.order.id)
+  const rows = await sql<{ n: number }[]>`select count(*)::int as n from orders`
+  assert.equal(rows[0]?.n, 1)
+})
+
+test('a key reused for a different order is a 409, not somebody else’s receipt', { skip }, async () => {
+  const { symbol } = await seedExchange()
+  const key = freshKey('order')
+  await call('/v1/exchange/orders', { method: 'POST', token: 'alice', key, body: orderBody(symbol) })
+  const different = await call('/v1/exchange/orders', {
+    method: 'POST',
+    token: 'alice',
+    key,
+    body: orderBody(symbol, { qty: (TEN_LOTS * 2n).toString() }),
+  })
+  assert.equal(different.status, 409)
+})
+
+test('an order that breaks a market rule is 422 with the code the browser points at a control', { skip }, async () => {
+  const { symbol } = await seedExchange()
+  // 422 and not 400: the request was well-formed and understood. What was refused is the ORDER.
+  const notALot = await call('/v1/exchange/orders', {
+    method: 'POST',
+    token: 'alice',
+    body: orderBody(symbol, { qty: (LOT + 1n).toString() }),
+  })
+  assert.equal(notALot.status, 422)
+  assert.equal(notALot.body.error.code, 'qty_not_a_lot')
+
+  const notATick = await call('/v1/exchange/orders', {
+    method: 'POST',
+    token: 'alice',
+    body: orderBody(symbol, { price: (PRICE + 1n).toString() }),
+  })
+  assert.equal(notATick.body.error.code, 'price_not_a_tick')
+})
+
+test('an order nobody can pay for is a 409 and leaves no row behind', { skip }, async () => {
+  const { symbol } = await seedExchange()
+  const response = await call('/v1/exchange/orders', {
+    method: 'POST',
+    token: 'alice',
+    body: orderBody(symbol, { qty: (TEN_LOTS * 1_000n).toString() }),
+  })
+  assert.equal(response.status, 409)
+  assert.equal(response.body.error.code, 'insufficient_funds')
+  const rows = await sql<{ n: number }[]>`select count(*)::int as n from orders`
+  assert.equal(rows[0]?.n, 0)
+})
+
+test('a crossing pair fills, and each side sees only its own fills', { skip }, async () => {
+  const { symbol } = await seedExchange()
+  await call('/v1/exchange/orders', {
+    method: 'POST',
+    token: 'bob',
+    body: orderBody(symbol, { side: 'sell' }),
+  })
+  const taken = await call('/v1/exchange/orders', { method: 'POST', token: 'alice', body: orderBody(symbol) })
+  assert.equal(taken.body.order.status, 'filled')
+  assert.equal(taken.body.fills.length, 1)
+  assert.equal(taken.body.fills[0].role, 'taker')
+  assert.equal(taken.body.order.averagePrice, PRICE.toString())
+
+  const mine = await call('/v1/exchange/fills', { token: 'alice' })
+  const theirs = await call('/v1/exchange/fills', { token: 'bob' })
+  assert.equal(mine.body.fills.length, 1)
+  assert.equal(mine.body.fills[0].role, 'taker')
+  assert.equal(theirs.body.fills[0].role, 'maker')
+
+  // The public tape carries the trade and names nobody: a book that published counterparties would
+  // let anyone reconstruct another customer's position from a screen.
+  const tape = await call(`/v1/exchange/markets/${symbol}/trades`, { token: 'bob' })
+  assert.equal(tape.body.trades.length, 1)
+  assert.equal(tape.body.trades[0].takerSide, 'buy')
+  assert.equal(JSON.stringify(tape.body).includes(ALICE), false)
+  assert.equal(JSON.stringify(tape.body).includes(BOB), false)
+})
+
+test('depth, ticker and candles are drawn from the trades and not from a counter', { skip }, async () => {
+  const { symbol } = await seedExchange()
+  await call('/v1/exchange/orders', { method: 'POST', token: 'bob', body: orderBody(symbol, { side: 'sell' }) })
+  await call('/v1/exchange/orders', { method: 'POST', token: 'alice', body: orderBody(symbol) })
+  await call('/v1/exchange/orders', {
+    method: 'POST',
+    token: 'bob',
+    body: orderBody(symbol, { side: 'sell', qty: LOT.toString() }),
+  })
+
+  const depth = await call(`/v1/exchange/markets/${symbol}/depth`, { token: 'alice' })
+  assert.deepEqual(depth.body.depth.asks, [{ price: PRICE.toString(), qty: LOT.toString(), orders: 1 }])
+
+  const day = await call(`/v1/exchange/markets/${symbol}/ticker`, { token: 'alice' })
+  assert.equal(day.body.ticker.last, PRICE.toString())
+  assert.equal(day.body.ticker.baseVolume, TEN_LOTS.toString())
+  assert.equal(day.body.ticker.trades, 1)
+
+  const candles = await call(`/v1/exchange/markets/${symbol}/candles?interval=5m`, { token: 'alice' })
+  assert.equal(candles.body.interval, '5m')
+  assert.equal(candles.body.candles.length, 1)
+  assert.equal(candles.body.candles[0].close, PRICE.toString())
+
+  assert.equal((await call(`/v1/exchange/markets/${symbol}/candles?interval=3s`, { token: 'alice' })).status, 400)
+})
+
+test('an order’s own history says why it did what it did', { skip }, async () => {
+  const { symbol } = await seedExchange()
+  const placed = await call('/v1/exchange/orders', { method: 'POST', token: 'alice', body: orderBody(symbol) })
+  const id = placed.body.order.id
+  await call(`/v1/exchange/orders/${id}`, { method: 'DELETE', token: 'alice' })
+
+  const events = await call(`/v1/exchange/orders/${id}/events`, { token: 'alice' })
+  assert.deepEqual(events.body.events.map((e: any) => e.kind), ['accepted', 'cancelled'])
+  assert.equal(events.body.events[1].detail, 'cancelled_by_owner')
+})
+
+test('cancelling twice is a 409, and cancelling somebody else’s order does not confirm it exists', { skip }, async () => {
+  const { symbol } = await seedExchange()
+  const placed = await call('/v1/exchange/orders', { method: 'POST', token: 'alice', body: orderBody(symbol) })
+  const id = placed.body.order.id
+
+  const first = await call(`/v1/exchange/orders/${id}`, { method: 'DELETE', token: 'alice' })
+  assert.equal(first.status, 200)
+  assert.equal(first.body.order.status, 'cancelled')
+
+  // No idempotency key on this route by design: the order id IS the key, and answering 200 to a
+  // cancel that cancelled nothing is how somebody ends up believing they are flat.
+  const again = await call(`/v1/exchange/orders/${id}`, { method: 'DELETE', token: 'alice' })
+  assert.equal(again.status, 409)
+  assert.equal(again.body.error.code, 'order_state')
+
+  const nosy = await call(`/v1/exchange/orders/${id}`, { method: 'DELETE', token: 'bob' })
+  assert.equal(nosy.body.error.message, 'no such order')
+  assert.equal((await call(`/v1/exchange/orders/${id}`, { token: 'bob' })).status, 404)
+})
+
+test('the panic button pulls everything and replays the first attempt’s list', { skip }, async () => {
+  const { symbol } = await seedExchange()
+  await call('/v1/exchange/orders', { method: 'POST', token: 'alice', body: orderBody(symbol) })
+  await call('/v1/exchange/orders', {
+    method: 'POST',
+    token: 'alice',
+    body: orderBody(symbol, { side: 'sell', price: (PRICE * 3n).toString() }),
+  })
+
+  const key = freshKey('panic')
+  const first = await call('/v1/exchange/orders/cancel-all', { method: 'POST', token: 'alice', key, body: {} })
+  assert.equal(first.status, 200)
+  assert.equal(first.body.cancelled.length, 2)
+
+  // The honest answer to "what did my panic button cancel" is the list the FIRST attempt produced,
+  // not the empty list a retry finds. That is only possible because the claim and the cancels share
+  // one transaction.
+  const replay = await call('/v1/exchange/orders/cancel-all', { method: 'POST', token: 'alice', key, body: {} })
+  assert.equal(replay.body.cancelled.length, 2)
+
+  const open = await call('/v1/exchange/orders?open=true', { token: 'alice' })
+  assert.equal(open.body.orders.length, 0)
+})
+
+test('a deposit settles inline and a retry re-reads it rather than moving money twice', { skip }, async () => {
+  await seedExchange()
+  const key = freshKey('xfer')
+  const body = { direction: 'deposit', asset: 'BTC', amount: '5000' }
+  const first = await call('/v1/exchange/transfers', { method: 'POST', token: 'alice', key, body })
+  assert.equal(first.status, 201, JSON.stringify(first.body))
+  assert.equal(first.body.outcome, 'settled')
+  assert.equal(first.body.transfer.amount, '5000')
+
+  const replay = await call('/v1/exchange/transfers', { method: 'POST', token: 'alice', key, body })
+  assert.equal(replay.status, 200)
+  assert.equal(replay.body.transfer.id, first.body.transfer.id)
+  // The stored response is the transfer id and nothing else, so a replay reads CURRENT state — and
+  // the ledger sees one entry however many times the request is retried.
+  assert.equal(ledger.entries.length, 1)
+
+  const listed = await call('/v1/exchange/transfers', { token: 'alice' })
+  assert.equal(listed.body.transfers.length, 1)
+})
+
+test('an asset the estate has retired cannot be moved into custody', { skip }, async () => {
+  await seedExchange()
+  const response = await call('/v1/exchange/transfers', {
+    method: 'POST',
+    token: 'alice',
+    body: { direction: 'deposit', asset: 'SHARD', amount: '1' },
+  })
+  assert.equal(response.status, 400)
+  assert.match(response.body.error.message, /cannot be moved into exchange custody/)
+})
+
+test('halting a market is an operator’s job, and a halted market accepts nothing', { skip }, async () => {
+  const { symbol } = await seedExchange()
+  const refused = await call(`/v1/exchange/markets/${symbol}/status`, {
+    method: 'POST',
+    token: 'alice',
+    body: { status: 'halted' },
+  })
+  assert.equal(refused.status, 403)
+
+  const halted = await call(`/v1/exchange/markets/${symbol}/status`, {
+    method: 'POST',
+    token: 'admin',
+    body: { status: 'halted' },
+  })
+  assert.equal(halted.status, 200)
+  assert.equal(halted.body.market.status, 'halted')
+
+  const order = await call('/v1/exchange/orders', { method: 'POST', token: 'alice', body: orderBody(symbol) })
+  assert.equal(order.status, 422)
+  assert.equal(order.body.error.code, 'market_halted')
+
+  const bad = await call(`/v1/exchange/markets/${symbol}/status`, {
+    method: 'POST',
+    token: 'admin',
+    body: { status: 'closed-for-lunch' },
+  })
+  assert.equal(bad.status, 400)
+})
+
+test('a mutating exchange route without an idempotency key is refused', { skip }, async () => {
+  const { symbol } = await seedExchange()
+  const response = await call('/v1/exchange/orders', {
+    method: 'POST',
+    token: 'alice',
+    key: null,
+    body: orderBody(symbol),
+  })
+  assert.equal(response.status, 400)
+  assert.match(response.body.error.message, /idempotency-key/)
+})
+
+test('a flood is refused with a 429 and a retry-after a client can honour', { skip }, async () => {
+  await seedExchange()
+  // Twenty a minute for transfers, and the limit is consumed BEFORE the body is read — so a client
+  // in an error loop cannot hold its own counter down by sending requests that fail validation.
+  const flood = { direction: 'nonsense', asset: 'BTC', amount: '1' }
+  for (let i = 0; i < 20; i += 1) {
+    const response = await call('/v1/exchange/transfers', { method: 'POST', token: 'alice', body: flood })
+    assert.equal(response.status, 400, `request ${i} should have reached validation`)
+  }
+  const limited = await call('/v1/exchange/transfers', { method: 'POST', token: 'alice', body: flood })
+  assert.equal(limited.status, 429)
+  assert.equal(limited.body.error.code, 'rate_limited')
+  assert.ok(Number(limited.headers.get('retry-after')) >= 1)
+
+  // And another customer is unaffected: the bucket is per subject, not per route.
+  assert.equal((await call('/v1/exchange/transfers', { method: 'POST', token: 'bob', body: flood })).status, 400)
+})
+
+test('an admin may read a customer’s orders, and a customer may not read anyone else’s', { skip }, async () => {
+  const { symbol } = await seedExchange()
+  await call('/v1/exchange/orders', { method: 'POST', token: 'alice', body: orderBody(symbol) })
+
+  const asAdmin = await call(`/v1/exchange/orders?userId=${ALICE}`, { token: 'admin' })
+  assert.equal(asAdmin.body.orders.length, 1)
+  // Bob naming Alice is a 403 and not an empty list. Quietly substituting his own id would answer a
+  // question he did not ask, and a client that believed the answer would report "Alice has no open
+  // orders" to somebody who is not allowed to know either way.
+  const asBob = await call(`/v1/exchange/orders?userId=${ALICE}`, { token: 'bob' })
+  assert.equal(asBob.status, 403)
+  assert.equal((await call('/v1/exchange/orders', { token: 'bob' })).body.orders.length, 0)
+})
+
+test('a service without the write scope may read the book but not trade on it', { skip }, async () => {
+  const { symbol } = await seedExchange()
+  assert.equal((await call('/v1/exchange/markets', { token: 'svc-none' })).status, 403)
+  assert.equal((await call('/v1/exchange/markets', { token: 'svc-write' })).status, 200)
+  const placed = await call('/v1/exchange/orders', {
+    method: 'POST',
+    token: 'svc-write',
+    body: { ...orderBody(symbol), userId: ALICE },
+  })
+  assert.equal(placed.status, 201, JSON.stringify(placed.body))
 })
