@@ -15,20 +15,22 @@
  *      below: build an envelope with the relay's own `buildEnvelope` and hand it to the contract's
  *      own `classifyEnvelope`.
  *
- * NOTE that the registry names exactly ONE `trade.*` topic — `trade.bot.paused`, adopted by
- * `micro-contracts` `8889373` — and the other six are still quarantined. So the envelope check
- * would pass vacuously for six of seven if the quarantine excused everything. It does not:
- * `envelopeDefects excuses a lagging registry and nothing else` proves a real defect is still
- * reported on a quarantined topic.
+ * NOTE that the registry now names ALL SEVEN `trade.*` topics — `trade.bot.paused` alone from
+ * `micro-contracts` `8889373`, and the other six with micro-org#345 — so the quarantine is empty
+ * and nothing in this file is excused any more. That matters to how these checks read: while six
+ * were quarantined, the envelope check passed for them only because the quarantine forgave the
+ * topic, and `envelopeDefects excuses a lagging registry and nothing else` existed to prove the
+ * forgiveness stopped at the topic. It is now a check on a repository with nothing to forgive, and
+ * says so rather than pretending otherwise.
  *
- * The registered one carries a third obligation the other four do not, and it is the reason
- * `the key trade.bot.paused is emitted with is the key the registry says it is` exists.
+ * Registration is also what makes the third obligation reachable, and it is the reason
+ * `every key these emit sites pass is the key the registry says they pass` exists.
  * `TopicSpec.keyedBy` is PROSE — a column name in a frozen object, not a type — so no compiler can
  * make an emit site pass what it names. `custody` registered both ceremony topics `keyedBy:
  * 'user_id'` while the emit sites passed the address, and `activity` reads the envelope key AS the
  * subject id, so every export was filed against a user that does not exist while every name check
- * in the estate stayed green. Registration is what makes that failure mode reachable here, so it
- * is what the new test guards.
+ * in the estate stayed green. That check covered one topic when one was registered; it covers all
+ * seven now, which is where four money topics with a second id in scope at the emit have arrived.
  *
  * No database. Pure text, set arithmetic and one function call, so it runs in CI even when the
  * database-backed suite skips.
@@ -47,6 +49,7 @@ import {
   parseVersion,
   topicsProducedBy,
   verifyDelivery,
+  type TopicName,
 } from '@cloudsforge/contracts-events'
 import { buildEnvelope, signEvent, verifyEventSignature } from './outbox.ts'
 import {
@@ -162,19 +165,13 @@ test('a pending proposal disappears once contracts adopts it', () => {
     'an emitted topic is registered or quarantined — this says it is neither, or counted twice',
   )
   // And the split itself, pinned, so moving a topic across the line is a deliberate edit here.
-  // `trade.bot.paused` is the one contracts has adopted (micro-contracts 8889373); the six that
-  // remain include `trade.fill.settled`, `trade.fee.settled` and `trade.transfer.settled`, which
-  // are the ones where money moves and the ones `contracts/packages/events/src/audit.ts` commits
-  // to auditing when they land.
-  assert.deepEqual(topicsProducedBy(SERVICE), ['trade.bot.paused'])
-  assert.deepEqual(Object.keys(AWAITING_REGISTRATION).sort(), [
-    'trade.bot.created',
-    'trade.bot.started',
-    'trade.fee.settled',
-    'trade.fill.settled',
-    'trade.order.filled',
-    'trade.transfer.settled',
-  ])
+  // The line has moved once and is now at the end: `trade.bot.paused` was adopted alone
+  // (micro-contracts 8889373) and the other six followed with micro-org#345, so the registry owns
+  // all seven and the quarantine owns none. Pinned as an EQUALITY against `EMITTED_TOPICS` rather
+  // than as a count, because a count is the thing a reader can restore to green by adjusting a
+  // number — and pinned in both tables, because "registered" and "not quarantined" are two facts.
+  assert.deepEqual([...topicsProducedBy(SERVICE)].sort(), [...EMITTED_TOPICS].sort())
+  assert.deepEqual(Object.keys(AWAITING_REGISTRATION), [])
 })
 
 /**
@@ -191,28 +188,67 @@ test('a pending proposal disappears once contracts adopts it', () => {
  * the standing version — it reads the real emit site out of `src/` and matches it against the
  * registered `keyedBy`, so moving the key to (say) `bot.userId` goes red here rather than silently
  * refiling every pause event against the wrong aggregate.
+ *
+ * It covered one topic while six sat in the quarantine, where `malformedProposals()` could check
+ * the spec's SHAPE and nothing could check it against the code. All seven were registered together
+ * (micro-org#345), so all seven are checked here — and the six new ones are where the custody
+ * defect would have landed, because four of them move money and each has a second id in scope at
+ * the emit: `transfer.userId` beside `transfer.id`, `bot.userId` beside `bot.id`, `value.fill.botId`
+ * beside `value.fill.id`.
  */
-test('the key trade.bot.paused is emitted with is the key the registry says it is', () => {
-  const spec = TOPICS['trade.bot.paused']
-  assert.equal(spec.keyedBy, 'bot_id', 'the registered ordering key changed under this emit site')
 
-  const bots = readFileSync(join(SRC, 'bots.ts'), 'utf8')
-  const emits = bots
-    .split('\n')
-    .map((line, index) => ({ line, at: `bots.ts:${index + 1}` }))
-    .filter(({ line }) => line.includes("topic: 'trade.bot.paused'"))
-  // If the emit moves or is duplicated, this is what notices — a second emit site is how one topic
-  // acquires two payload shapes, which is the thing that made `identity.mfa.changed`
-  // unregisterable by construction.
-  assert.equal(emits.length, 1, 'trade.bot.paused should have exactly one emit site')
+/**
+ * What each emit site really passes as the key, and what the registry must therefore say.
+ *
+ * Read off `src/` on 2026-08-10 while the six specs were being pasted into the registry, which is
+ * the only moment the two can be reconciled by hand — after that this test is the reconciliation.
+ * The `keyedBy` column is the ASSERTION, not a copy of the registry: it is what a reader of this
+ * file would say the expression means, so a registry entry edited to match a changed emit still
+ * has to come past a human here.
+ */
+const EMIT_SITES = Object.freeze({
+  'trade.bot.created': { file: 'bots.ts', key: 'bot.id', keyedBy: 'bot_id' },
+  'trade.bot.started': { file: 'bots.ts', key: 'bot.id', keyedBy: 'bot_id' },
+  'trade.bot.paused': { file: 'bots.ts', key: 'bot.id', keyedBy: 'bot_id' },
+  'trade.fill.settled': { file: 'fills.ts', key: 'value.fill.id', keyedBy: 'fill_id' },
+  'trade.fee.settled': { file: 'fees.ts', key: 'row.id', keyedBy: 'settlement_id' },
+  'trade.order.filled': { file: 'exchange.ts', key: 'order.id', keyedBy: 'order_id' },
+  'trade.transfer.settled': { file: 'transfers.ts', key: 'transfer.id', keyedBy: 'transfer_id' },
+} as const)
 
-  // `bot_id` means `bot.id`, and nothing else. `bot.userId` is the other id in scope at that line
-  // and is exactly the substitution custody made.
-  assert.match(
-    emits[0]!.line,
-    /key: bot\.id\b/,
-    `${emits[0]!.at} passes something other than bot.id as the key, while the registry says bot_id`,
-  )
+test('every key these emit sites pass is the key the registry says they pass', () => {
+  // The table covers the emitted set exactly, so adding a topic without adding it here fails
+  // rather than being silently unchecked — the property the one-topic version of this test did
+  // not have and did not need.
+  assert.deepEqual(Object.keys(EMIT_SITES).sort(), [...EMITTED_TOPICS].sort())
+
+  for (const [topic, site] of Object.entries(EMIT_SITES)) {
+    assert.equal(
+      TOPICS[topic as TopicName].keyedBy,
+      site.keyedBy,
+      `${topic}: the registered ordering key changed under this emit site`,
+    )
+
+    const lines = readFileSync(join(SRC, site.file), 'utf8').split('\n')
+    const emits = lines
+      .map((line, index) => ({ index, at: `${site.file}:${index + 1}` }))
+      .filter(({ index }) => lines[index]!.includes(`topic: '${topic}'`))
+    // If an emit moves or is duplicated, this is what notices — a second emit site is how one topic
+    // acquires two payload shapes, which is the thing that made `identity.mfa.changed`
+    // unregisterable by construction.
+    assert.equal(emits.length, 1, `${topic} should have exactly one emit site`)
+
+    // `key:` is on the emit's own line for the one-line calls and on the next for the rest, so the
+    // window is three lines and never wider: a wider one would start matching the NEXT emit's key
+    // in `bots.ts`, where three of these live within a dozen lines of each other.
+    const window = lines.slice(emits[0]!.index, emits[0]!.index + 3).join('\n')
+    const expected = new RegExp(`key: ${site.key.replace(/\./g, '\\.')}(?![\\w.])`)
+    assert.match(
+      window,
+      expected,
+      `${emits[0]!.at} passes something other than ${site.key} as the key, while the registry says ${site.keyedBy}`,
+    )
+  }
 })
 
 test('every pending proposal carries a spec that could be pasted into the registry', () => {
@@ -273,19 +309,29 @@ test('a row with no actor and no correlation id still makes a readable envelope'
 test('envelopeDefects excuses a lagging registry and nothing else', () => {
   // The tolerance is narrow on purpose. An unregistered topic this repository has explained is a
   // consumer being behind its producers; anything else is this service emitting the unreadable.
-  const quarantined = buildEnvelope({ ...ROW, topic: 'trade.fill.settled' })
-  assert.deepEqual(envelopeDefects(JSON.parse(JSON.stringify(quarantined))), [])
+  //
+  // The quarantine is EMPTY as of micro-org#345, so the excusing branch has nothing to excuse and
+  // this test drives it with a topic the quarantine names rather than with one it does not — which
+  // would have been an assertion that could not fail. The tolerance is exercised through the
+  // function's own input, not through a fixture that happens to be quarantined this week.
+  assert.deepEqual(Object.keys(AWAITING_REGISTRATION), [], 'a proposal is back; drive it with that one')
+  const registered = buildEnvelope({ ...ROW, topic: 'trade.fill.settled' })
+  assert.deepEqual(envelopeDefects(JSON.parse(JSON.stringify(registered))), [])
 
-  // An unregistered topic the quarantine does NOT explain is not excused.
+  // An unregistered topic the quarantine does NOT explain is not excused — and today that is every
+  // unregistered topic, which is the point of an empty quarantine rather than a gap in the test.
   const unexplained = { ...buildEnvelope(ROW), topic: 'trade.nothing.happened' }
   assert.ok(envelopeDefects(unexplained).length > 0)
 
-  // And a real envelope defect is never excused, even on a quarantined topic.
-  const broken = { ...quarantined, version: 1 as unknown as string }
-  assert.ok(
-    envelopeDefects(broken).some((error) => error.startsWith('version:')),
-    'an integer version must be reported however the topic is registered',
-  )
+  // And a real envelope defect is never excused, however the topic is registered. This is the
+  // assertion that stopped the check being vacuous while six topics rode the quarantine.
+  for (const envelope of [registered, { ...buildEnvelope(ROW), topic: 'trade.nothing.happened' }]) {
+    const broken = { ...envelope, version: 1 as unknown as string }
+    assert.ok(
+      envelopeDefects(broken).some((error) => error.startsWith('version:')),
+      `an integer version must be reported on ${String(broken.topic)}`,
+    )
+  }
 })
 
 /**

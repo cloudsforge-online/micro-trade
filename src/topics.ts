@@ -32,26 +32,33 @@
  *      a real envelope through the relay's own `buildEnvelope` and hands it to the contract's own
  *      `classifyEnvelope`.
  *
- * ## One of the seven is now registered; the other six are still quarantined
+ * ## All seven are registered, and the quarantine below is empty
  *
- * `trade` IS a valid `ProducerService` in the contract's union and, as of `micro-contracts`
- * `8889373`, owns exactly one topic in `TOPICS`: **`trade.bot.paused`**, adopted verbatim from the
- * entry that used to sit below. The other six still sit in the quarantine, each carrying the exact
- * `TopicSpec` `micro-contracts` should paste — the last two of them added with the order book.
+ * `trade` IS a valid `ProducerService` in the contract's union. It owned exactly one topic in
+ * `TOPICS` — **`trade.bot.paused`**, adopted verbatim from the quarantine as of `micro-contracts`
+ * `8889373` — and as of micro-org#345 it owns all seven: the other six were pasted into the
+ * registry from the specs that used to sit below, and deleted from here the same day. That is the
+ * whole cycle this table is for, run twice, and the deletion is not tidying: `adoptedProposals()`
+ * fails while a registered topic is still proposed, so the quarantine empties itself or the suite
+ * stays red.
  *
- * That is still the reason `activity` files most trade events as `unclassified` — a bot a user
- * started, a fill they were charged for and a performance fee taken from their account are all
- * events nobody has named. The ones that matter most are `trade.fill.settled`, `trade.fee.settled`
- * and now `trade.transfer.settled`, because those are the ones where money moves;
- * `contracts/packages/events/src/audit.ts` says so in the `trade.bot.paused` entry and commits to
- * auditing them when they land.
+ * What it cost while it was full is worth keeping written down, because it was never the missing
+ * timeline entries that mattered most. `activity` filed every trade event as `unclassified` —
+ * a bot a user started, a fill they were charged for and a performance fee taken from their
+ * account were all events nobody had named — which is 90-day quarantine retention on four topics
+ * that move money, where a financial record gets 1825. And `activity`'s unregistered branch cannot
+ * check what a `TopicSpec` is the only source of: an envelope claiming `producer: 'wallet'` on a
+ * trade topic was shelved with no defect reported at all, because ownership is a property of the
+ * registry entry that did not exist. Measured on 2026-08-10, before the registration:
+ * `{ topic: 'trade.fee.settled', producer: 'wallet' }` classified as `unregistered_topic` with an
+ * empty defect list, while the same forgery on `trade.bot.paused` came back `malformed`.
  *
- * The registration also changes what a mistake COSTS here. While every `trade.*` topic was
- * unregistered, `activity` took its unregistered-topic branch and quarantined without validating,
- * so an envelope defect on a trade event was invisible. `trade.bot.paused` is now validated on
- * arrival like any registered topic, so a defect in the envelope carrying it is refused rather than
- * shelved. `topics.test.ts` builds that envelope with this service's own relay and hands it to the
- * contract's own `classifyEnvelope`, which is the check that closes the gap on this side.
+ * `contracts/packages/events/src/audit.ts` committed, in its `trade.bot.paused` entry, to auditing
+ * the money topics when they landed; `TOPIC_AUDIT` now carries all six decisions.
+ *
+ * `topics.test.ts` builds the envelope with this service's own relay and hands it to the contract's
+ * own `classifyEnvelope`, which is the check that closes the gap on this side — and it is now a
+ * check with seven topics to answer for rather than one.
  */
 
 import {
@@ -104,87 +111,19 @@ export interface ProposedTopic {
  *
  * `keyedBy` on each is read off the emit site, never chosen here: the key is the ordering
  * partition, so it is contract rather than a producer's private preference.
+ *
+ * ── EMPTY, AND THAT IS THE TABLE WORKING. micro-org#345, 2026-08-10. ──────────────────────────
+ *
+ * It held six entries until `micro-contracts` pasted all six into `TOPICS` verbatim — every field
+ * of every spec, `keyedBy` included, went across unchanged, which is the property that makes this
+ * a copy rather than a second design. `adoptedProposals()` turned non-empty the moment the
+ * registry adopted them, this suite went red, and the entries are deleted rather than kept with a
+ * note. The type stays `ProposedTopic` and the reconciliation below stays wired to it, because the
+ * next topic this service adds arrives here first: an emit site whose topic is in neither the
+ * registry nor this table fails `topics.test.ts`, and that check is the reason nothing was ever
+ * emitted under a name the estate could not read.
  */
-export const AWAITING_REGISTRATION: Readonly<Record<string, ProposedTopic>> = Object.freeze({
-  'trade.bot.created': {
-    reason:
-      "A user configured an automated strategy against their own money. activity's timeline has no entry for it and notify has no rule, because no registry names it.",
-    spec: {
-      producer: 'trade',
-      payloadType: 'BotCreated',
-      version: '1.0',
-      keyedBy: 'bot_id',
-      description: 'A trading bot was configured, with its mode, strategy and allocation.',
-    },
-  },
-  'trade.bot.started': {
-    reason:
-      'The moment money starts moving on its own. It carries the ledger reservation id, which is the only thing a consumer can reconcile the allocation against.',
-    spec: {
-      producer: 'trade',
-      payloadType: 'BotStarted',
-      version: '1.0',
-      keyedBy: 'bot_id',
-      description: 'A bot began trading and its allocation was reserved through the ledger.',
-    },
-  },
-  // `trade.bot.paused` was here until contracts-events registered it (micro-contracts 8889373,
-  // adopted verbatim: `keyedBy: 'bot_id'`, `payloadType: 'BotPaused'`). Deleted rather than kept
-  // with a note, because `adoptedProposals()` fails while it is present and that failure IS the
-  // self-emptying quarantine. `bots.ts` still passes `bot.id` as the key, which is what the
-  // registered `keyedBy` names; `topics.test.ts` now pins that agreement from this side.
-  'trade.fill.settled': {
-    reason:
-      'Keyed by FILL id, not bot id, and that difference is real: two fills for one bot have no ordering relationship to each other and pretending otherwise would serialise a bot behind its own history.',
-    spec: {
-      producer: 'trade',
-      payloadType: 'FillSettled',
-      version: '1.0',
-      keyedBy: 'fill_id',
-      description: 'A bot fill settled against the ledger, with its journal entry.',
-    },
-  },
-  'trade.fee.settled': {
-    reason:
-      "A performance fee was taken from a user's account. 10.5's `bot.settle` lease exists to stop this being double-billed; a consumer cannot check that today because the fact never reaches one.",
-    spec: {
-      producer: 'trade',
-      payloadType: 'FeeSettled',
-      version: '1.0',
-      keyedBy: 'settlement_id',
-      description: 'A performance fee settlement completed for a bot period, with its entry.',
-    },
-  },
-  // The two below belong to the order book, which ships behind TRADE_EXCHANGE_ENABLED (see
-  // `src/env.ts` and R-54 in docs/ecosystem/16-risks-and-open-decisions.md). They are proposed
-  // anyway rather than held back until the flag goes on: a topic nobody has named is exactly the
-  // state that made every other `trade.*` event arrive at `activity` as `unclassified`, and the
-  // moment the flag IS turned on is the worst moment to discover the estate cannot read the events.
-  'trade.order.filled': {
-    reason:
-      "One order crossed the book and moved two customers' balances. Keyed by the TAKER order id rather than by the user, because an order is the aggregate a consumer follows and one order can fill against many makers in one pass — a per-trade topic would print an unbounded burst for a single customer action.",
-    spec: {
-      producer: 'trade',
-      payloadType: 'OrderFilled',
-      version: '1.0',
-      keyedBy: 'order_id',
-      description:
-        'An exchange order filled, wholly or partly, with the quantity and notional it traded.',
-    },
-  },
-  'trade.transfer.settled': {
-    reason:
-      "Money crossed the boundary between the user's wallet and their exchange balance, and it is the only trade event that corresponds to a ledger entry a consumer can reconcile against. Keyed by transfer id because that is the idempotency subject: one transfer, one journal entry, one event.",
-    spec: {
-      producer: 'trade',
-      payloadType: 'TransferSettled',
-      version: '1.0',
-      keyedBy: 'transfer_id',
-      description:
-        'A deposit into or withdrawal out of an exchange balance settled against the ledger.',
-    },
-  },
-})
+export const AWAITING_REGISTRATION: Readonly<Record<string, ProposedTopic>> = Object.freeze({})
 
 /* ------------------------------------------------------------------ reconciliation */
 
