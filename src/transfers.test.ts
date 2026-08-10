@@ -27,6 +27,7 @@ import {
   transferPostings,
   type TransferRecord,
 } from './transfers.ts'
+import { EXCHANGE, parseAccountSubject } from '@cloudsforge/contracts-money'
 import { InsufficientFundsError, getBalance } from './accounts.ts'
 import { withOutbox, type Db } from './outbox.ts'
 import { SERVICE } from './topics.ts'
@@ -123,6 +124,41 @@ describe('the postings a transfer makes', { skip }, () => {
 
   test('are keyed on the row id, so a retry replays instead of moving money twice', () => {
     assert.equal(transferIdempotencyKey('abc'), 'trade:xfer:abc')
+  })
+})
+
+/**
+ * micro-org#372, and NOT gated on a database — that is the whole point of putting it in its own
+ * group. `transferPostings` is pure, and every case above it is skipped without postgres, so the
+ * defect this covers had no test that could run in CI at all.
+ *
+ * The defect: the escrow leg named `subject: 'exchange'` and the estate's subject grammar had no
+ * such subject, so `parseAccountSubject` threw inside micro-ledger's `ensureAccount` and every
+ * posting this function makes died there. `AccountRef.subject` is a `string` on the wire, so
+ * nothing in the compiler objected, and the order book is off behind TRADE_EXCHANGE_ENABLED, so
+ * nothing in production had tried it. Asserting the SUBJECT PARSES is the check that would have
+ * caught it; asserting it equals `'exchange'`, as the cases above do, is not — that is the
+ * spelling agreeing with itself.
+ */
+describe('the subjects a transfer names are ones the ledger will accept', () => {
+  test('both legs parse, both directions, and the escrow leg is the exchange omnibus', () => {
+    for (const direction of ['deposit', 'withdrawal'] as const) {
+      const postings = transferPostings({ userId: ALICE, asset: 'BTC', direction, amount: 500n })
+      for (const posting of postings) {
+        assert.doesNotThrow(
+          () => parseAccountSubject(posting.account.subject),
+          `${posting.account.subject} is not an account subject — micro-ledger's ensureAccount throws on it`,
+        )
+      }
+      const escrow = postings.find((p) => p.account.subject === EXCHANGE)
+      assert.ok(escrow, 'one leg must be the exchange escrow')
+      assert.deepEqual(parseAccountSubject(escrow.account.subject), { kind: 'exchange' })
+      // Liability, and it matters: `reconcile.ts` sums liabilities by TYPE with no subject filter,
+      // so Σ liabilities is unchanged when a balance moves from a user wallet into escrow. An
+      // `equity` or `clearing` escrow would have broken the reconciliation invariant instead.
+      assert.equal(escrow.account.type, 'liability')
+      assert.equal(escrow.account.purpose, 'escrow')
+    }
   })
 })
 
