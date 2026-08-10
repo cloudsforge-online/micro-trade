@@ -34,6 +34,7 @@
  */
 
 import { CHAINS, RETIRED_ASSETS, type AssetCode } from '@cloudsforge/contracts-chain'
+import { EXCHANGE } from '@cloudsforge/contracts-money'
 import { amountFrom } from './money.ts'
 import { credit, debitAvailable, type Balance } from './accounts.ts'
 import {
@@ -117,6 +118,14 @@ const userSubject = (userId: string): string => `user:${userId}`
  * between two assets and cannot. The escrow account is subject `exchange`, purpose `escrow`, and it
  * is a LIABILITY: the exchange owes that balance back to the customers whose rows in
  * `exchange_accounts` add up to it.
+ *
+ * The subject comes from `EXCHANGE` in contracts-money rather than being spelled here, and that is
+ * not tidiness. It was the literal `'exchange'` from the day the order book shipped until
+ * micro-org#372, and the grammar had no such subject — so `parseAccountSubject` threw inside the
+ * ledger's `ensureAccount` and every posting this function makes would have died there, in both
+ * directions, for every asset. Nothing caught it: `AccountRef.subject` is a `string` on the wire,
+ * and the feature is off behind TRADE_EXCHANGE_ENABLED. Importing the constant is what makes a
+ * subject this service invents a compile error instead of a runtime one.
  */
 export function transferPostings(input: {
   readonly userId: string
@@ -131,7 +140,7 @@ export function transferPostings(input: {
     type: 'liability',
   }
   const escrow: AccountRef = {
-    subject: 'exchange',
+    subject: EXCHANGE,
     assetCode: input.asset,
     purpose: 'escrow',
     type: 'liability',
