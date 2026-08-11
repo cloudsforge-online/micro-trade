@@ -94,8 +94,8 @@ import type { Db, Emit } from './outbox.ts'
  * flatten — so its `equity` is a mark-to-market number from whenever it last ticked, against an
  * unrealised position that may be worth anything by now. Assessing it would bill a gain the user has
  * not made and cannot take. Worse, it would be arbitrary: the only thing putting a paused bot in the
- * sweep's second list is a Shard of arrears, so of two identical paused bots the one that happens to
- * owe 1 Shard would be billed for its whole unrealised gain and the other for nothing.
+ * sweep's second list is a cent of arrears, so of two identical paused bots the one that happens to
+ * owe 1 cent would be billed for its whole unrealised gain and the other for nothing.
  */
 export type SettleScope = 'assess' | 'arrears'
 
@@ -165,7 +165,7 @@ export interface SettleOutcome {
   /**
    * Set when the pass ended without a decided charge: the ledger is unreachable, an earlier row's
    * outcome is not known yet and invariant 4 holds the next assessment back until it is, or the only
-   * thing left to bill is arrears the wallet cannot cover a single Shard of.
+   * thing left to bill is arrears the wallet cannot cover a single cent of.
    *
    * Every one of these means "ask again", which is what the sweep is for.
    */
@@ -211,7 +211,7 @@ async function charge(
       // ledger replays its stored response and this is a no-op; if it did not, it happens now.
       idempotencyKey: settlementIdempotencyKey(row.botId, row.period),
       description: `Trade performance fee, period ${row.period}`,
-      postings: performanceFeePostings({ userId: row.userId, amountShards: row.attempted }),
+      postings: performanceFeePostings({ userId: row.userId, amountUsdCents: row.attempted }),
     })
     return { verdict: 'collected', entryId: entry.id }
   } catch (err) {
@@ -305,7 +305,7 @@ async function collect(deps: FeeDeps, row: SettlementRecord): Promise<{ collecte
     }
   }
 
-  const available = await deps.ledger.availableShards(row.userId)
+  const available = await deps.ledger.availableUsdCents(row.userId)
   if (available === null) {
     // The ledger would not say. That is not zero — it is "do not know" — so this row stays pending
     // and the next pass asks again. Reading it as zero would retire a row on the strength of an
@@ -437,7 +437,7 @@ export async function settle(
   }
 
   if (fee < 1n) {
-    // Nothing new to bill — every Shard of `due` is arrears assessed on some earlier pass and
+    // Nothing new to bill — every cent of `due` is arrears assessed on some earlier pass and
     // recorded on a row of its own. Ask what the wallet holds before writing another one.
     //
     // This is `collect`'s own rule moved one step earlier, and it exists because arrears do not
@@ -448,7 +448,7 @@ export async function settle(
     // A balance the ledger will not report reads as null and defers too. That is the safe direction:
     // the debt stays on `feeOwed`, the mark has not moved, and the next pass assesses the same
     // amount.
-    const available = await deps.ledger.availableShards(bot.userId)
+    const available = await deps.ledger.availableUsdCents(bot.userId)
     if (available === null || available < 1n) {
       return { settlement: null, deferred: 'the wallet cannot cover any of the arrears' }
     }
@@ -538,7 +538,7 @@ export async function settle(
     //
     // `due` and not `outstanding`, because `due - collected` is derivable and the reverse is not:
     // a consumer that wants the shortfall can subtract, and one that wants to know whether the
-    // whole assessment landed needs the assessment. Both are Shard counts in smallest units, which
+    // whole assessment landed needs the assessment. Both are cent counts in smallest units, which
     // is why the SENTENCE a consumer builds has to come off `status` — `trade` is a
     // smallest-units producer, so `money()` in activity declines to render either figure and a
     // template that tried would print a number eighteen orders of magnitude out.

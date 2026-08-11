@@ -9,7 +9,7 @@
  *
  * So, here:
  *
- *   * **Amounts are `bigint` Shards.** `startEquity`, `endEquity`, `feesPaid`, `bestTrade`,
+ *   * **Amounts are `bigint` US cents.** `startEquity`, `endEquity`, `feesPaid`, `bestTrade`,
  *     `worstTrade`. These are money and are exact.
  *   * **Proportions are `bigint` basis points.** `totalReturn`, `holdReturn`, `maxDrawdown`,
  *     `winRate`, `exposure`, `profitFactor`. A proportion of an exact amount is exactly computable
@@ -57,10 +57,10 @@ export interface SimulatedFill {
   readonly priceScaled: bigint
   /** Base-asset smallest units. */
   readonly qty: bigint
-  readonly notionalShards: bigint
-  readonly feeShards: bigint
-  /** Realised profit on a sell, in Shards. Absent on a buy — a buy realises nothing. */
-  readonly pnlShards?: bigint
+  readonly notionalUsdCents: bigint
+  readonly feeUsdCents: bigint
+  /** Realised profit on a sell, in US cents. Absent on a buy — a buy realises nothing. */
+  readonly pnlUsdCents?: bigint
   readonly reason: string
 }
 
@@ -74,9 +74,9 @@ export interface BacktestMetrics {
   readonly winRateBps: bigint
   /** Gross profit over gross loss, in bps. 10000 is break-even. See the note below on zero. */
   readonly profitFactorBps: bigint
-  readonly feesPaidShards: bigint
-  readonly bestTradeShards: bigint
-  readonly worstTradeShards: bigint
+  readonly feesPaidUsdCents: bigint
+  readonly bestTradeUsdCents: bigint
+  readonly worstTradeUsdCents: bigint
   readonly trades: number
   readonly wins: number
   readonly losses: number
@@ -94,7 +94,7 @@ export interface MetricsInput {
   /** Bars spent holding a position, over bars evaluated. */
   readonly barsHeld: number
   readonly barsTotal: number
-  readonly feesPaidShards: bigint
+  readonly feesPaidUsdCents: bigint
 }
 
 /**
@@ -140,7 +140,7 @@ export function maxDrawdownBps(equity: readonly bigint[]): bigint {
 }
 
 export function computeMetrics(input: MetricsInput): BacktestMetrics {
-  const { curve, fills, timeframe, startEquity, barsHeld, barsTotal, feesPaidShards } = input
+  const { curve, fills, timeframe, startEquity, barsHeld, barsTotal, feesPaidUsdCents } = input
   const equity = curve.map((p) => p.equity)
   const endEquity = equity.length > 0 ? (equity[equity.length - 1] as bigint) : startEquity
 
@@ -183,12 +183,12 @@ export function computeMetrics(input: MetricsInput): BacktestMetrics {
 
   const calmar = drawdown > 0n ? cagr / (Number(drawdown) / 10_000) : 0
 
-  const closed = fills.filter((f) => f.pnlShards !== undefined)
-  const wins = closed.filter((f) => (f.pnlShards ?? 0n) > 0n)
-  const losses = closed.filter((f) => (f.pnlShards ?? 0n) < 0n)
-  const grossProfit = wins.reduce((sum, f) => sum + (f.pnlShards ?? 0n), 0n)
-  const grossLoss = losses.reduce((sum, f) => sum - (f.pnlShards ?? 0n), 0n)
-  const pnls = closed.map((f) => f.pnlShards ?? 0n)
+  const closed = fills.filter((f) => f.pnlUsdCents !== undefined)
+  const wins = closed.filter((f) => (f.pnlUsdCents ?? 0n) > 0n)
+  const losses = closed.filter((f) => (f.pnlUsdCents ?? 0n) < 0n)
+  const grossProfit = wins.reduce((sum, f) => sum + (f.pnlUsdCents ?? 0n), 0n)
+  const grossLoss = losses.reduce((sum, f) => sum - (f.pnlUsdCents ?? 0n), 0n)
+  const pnls = closed.map((f) => f.pnlUsdCents ?? 0n)
 
   return {
     startEquity,
@@ -202,9 +202,9 @@ export function computeMetrics(input: MetricsInput): BacktestMetrics {
     // value — and JSON cannot carry Infinity. Zero is the sentinel; a reader tells the two cases
     // apart with `losses`, which is right here.
     profitFactorBps: grossLoss > 0n ? ratioBps(grossProfit, grossLoss) : 0n,
-    feesPaidShards,
-    bestTradeShards: pnls.length > 0 ? pnls.reduce((a, b) => (b > a ? b : a)) : 0n,
-    worstTradeShards: pnls.length > 0 ? pnls.reduce((a, b) => (b < a ? b : a)) : 0n,
+    feesPaidUsdCents,
+    bestTradeUsdCents: pnls.length > 0 ? pnls.reduce((a, b) => (b > a ? b : a)) : 0n,
+    worstTradeUsdCents: pnls.length > 0 ? pnls.reduce((a, b) => (b < a ? b : a)) : 0n,
     trades: fills.length,
     wins: wins.length,
     losses: losses.length,

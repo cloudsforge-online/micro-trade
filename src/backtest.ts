@@ -37,8 +37,8 @@ import {
   applyBps,
   amountTo,
   slippedPrice,
-  unitsForShards,
-  valueInShards,
+  unitsForCents,
+  valueInCents,
 } from './money.ts'
 import { seededRandom, jitterBps } from './rng.ts'
 import { compileSignals } from './strategies.ts'
@@ -138,7 +138,7 @@ export function run(input: RunInput): RunResult {
   const holdBasis = second ? second.o : (firstBar?.c ?? 0n)
   const holdEntry = holdBasis > 0n ? slippedPrice(holdBasis, slippageBps, 'buy') : 0n
   const holdUnits =
-    holdEntry > 0n ? unitsForShards(startCash - applyBps(startCash, feeBps), asset, holdEntry) : 0n
+    holdEntry > 0n ? unitsForCents(startCash - applyBps(startCash, feeBps), asset, holdEntry) : 0n
 
   for (let i = 0; i < bars.length; i++) {
     const bar = bars[i] as Bar
@@ -146,7 +146,7 @@ export function run(input: RunInput): RunResult {
     // Act on the PREVIOUS bar's signal, at this bar's open.
     const signal = i > 0 ? signals[i - 1] : undefined
     if (signal && signal.target !== null) {
-      const held = valueInShards(units, asset, bar.o)
+      const held = valueInCents(units, asset, bar.o)
       const openEquity = cash + held
       const desired = (openEquity * BigInt(signal.target)) / BPS_SCALE
       const delta = desired - held
@@ -164,7 +164,7 @@ export function run(input: RunInput): RunResult {
           const affordable = (cash * BPS_SCALE) / (BPS_SCALE + BigInt(feeBps))
           const notional = delta < affordable ? delta : affordable
           const price = slippedPrice(bar.o, effectiveSlippage, 'buy')
-          const bought = notional > 0n ? unitsForShards(notional, asset, price) : 0n
+          const bought = notional > 0n ? unitsForCents(notional, asset, price) : 0n
           if (bought > 0n) {
             const fee = applyBps(notional, feeBps)
             cash -= notional + fee
@@ -176,21 +176,21 @@ export function run(input: RunInput): RunResult {
               side: 'buy',
               priceScaled: price,
               qty: bought,
-              notionalShards: notional,
-              feeShards: fee,
+              notionalUsdCents: notional,
+              feeUsdCents: fee,
               reason: signal.reason,
             })
           }
         } else {
           const price = slippedPrice(bar.o, effectiveSlippage, 'sell')
-          const wanted = price > 0n ? unitsForShards(-delta, asset, price) : 0n
+          const wanted = price > 0n ? unitsForCents(-delta, asset, price) : 0n
           const sold = wanted < units ? wanted : units
           if (sold > 0n) {
-            const notional = valueInShards(sold, asset, price)
+            const notional = valueInCents(sold, asset, price)
             const fee = applyBps(notional, feeBps)
             // Average cost basis: the position is fungible, so a partial exit realises a
             // proportional slice of the cost, not FIFO lots. Computed in bigint, so the slice and
-            // the remainder always sum back to the whole — a float here leaks a Shard per exit and
+            // the remainder always sum back to the whole — a float here leaks a cent per exit and
             // the leak is what a reconciliation eventually finds.
             const released = (costBasis * sold) / units
             cash += notional - fee
@@ -202,9 +202,9 @@ export function run(input: RunInput): RunResult {
               side: 'sell',
               priceScaled: price,
               qty: sold,
-              notionalShards: notional,
-              feeShards: fee,
-              pnlShards: notional - fee - released,
+              notionalUsdCents: notional,
+              feeUsdCents: fee,
+              pnlUsdCents: notional - fee - released,
               reason: signal.reason,
             })
           }
@@ -215,8 +215,8 @@ export function run(input: RunInput): RunResult {
     if (units > 0n) barsHeld++
     curve.push({
       t: bar.t,
-      equity: cash + valueInShards(units, asset, bar.c),
-      hold: valueInShards(holdUnits, asset, bar.c),
+      equity: cash + valueInCents(units, asset, bar.c),
+      hold: valueInCents(holdUnits, asset, bar.c),
       priceScaled: bar.c,
     })
   }
@@ -228,7 +228,7 @@ export function run(input: RunInput): RunResult {
     startEquity: startCash,
     barsHeld,
     barsTotal: bars.length,
-    feesPaidShards: feesPaid,
+    feesPaidUsdCents: feesPaid,
   })
 
   const last = bars[bars.length - 1]

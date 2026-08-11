@@ -11,7 +11,8 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
   BPS_SCALE,
-  MIN_FEE_SHARDS,
+  CENTS_PER_USD,
+  MIN_FEE_CENTS,
   RATE_SCALE,
   amountFrom,
   amountTo,
@@ -23,8 +24,8 @@ import {
   performanceFee,
   slippedPrice,
   toTargetBps,
-  unitsForShards,
-  valueInShards,
+  unitsForCents,
+  valueInCents,
 } from './money.ts'
 import { jitterBps, seededRandom, fixedClock } from './rng.ts'
 import { atr, bollinger, ema, highestPrior, lowestPrior, macd, rsi, sma, toIndicatorSpace } from './indicators.ts'
@@ -36,17 +37,18 @@ import { parseAccountSubject } from '@cloudsforge/contracts-money'
 import { requestFingerprint } from './idempotency.ts'
 import { assertIngestable, stalenessIntervals, BarRejectedError } from './series.ts'
 import { makeBars } from './testsupport.ts'
+import { renameStoredMoneyKeys } from './backtests.ts'
 import type { Bar } from './indicators.ts'
 
 /* ------------------------------------------------------------------ money */
 
-test('a fee rounds down, so the fraction of a Shard is never taken from the customer', () => {
+test('a fee rounds down, so the fraction of a cent is never taken from the customer', () => {
   // 999 × 15% = 149.85. The house eats the .85 rather than rounding it onto the bill.
   assert.equal(applyBps(999n, 1_500), 149n)
   assert.equal(applyBpsUp(999n, 1_500), 150n)
 })
 
-test('a zero-rate charge is zero in both rounding directions, not one Shard', () => {
+test('a zero-rate charge is zero in both rounding directions, not one cent', () => {
   assert.equal(applyBps(1_000_000n, 0), 0n)
   assert.equal(applyBpsUp(1_000_000n, 0), 0n)
 })
@@ -65,24 +67,24 @@ test('slippage moves the price against the trader on both sides, never in their 
   assert.equal(buy - price, price - sell)
 })
 
-test('a holding is valued down, so a portfolio never claims a Shard the market would not pay', () => {
-  // 1 satoshi of BTC at $30,000 is 0.0003 Shards, which is zero whole Shards.
-  assert.equal(valueInShards(1n, 'BTC', 30_000n * RATE_SCALE), 0n)
-  // A whole BTC at $30,000 is 3,000,000 Shards exactly (100 Shards per USD).
-  assert.equal(valueInShards(100_000_000n, 'BTC', 30_000n * RATE_SCALE), 3_000_000n)
+test('a holding is valued down, so a portfolio never claims a cent the market would not pay', () => {
+  // 1 satoshi of BTC at $30,000 is 0.0003 cents, which is zero whole cents.
+  assert.equal(valueInCents(1n, 'BTC', 30_000n * RATE_SCALE), 0n)
+  // A whole BTC at $30,000 is 3,000,000 cents exactly — $30,000.00, at 100 cents per USD.
+  assert.equal(valueInCents(100_000_000n, 'BTC', 30_000n * RATE_SCALE), 3_000_000n)
 })
 
 test('valuing a holding at a zero price is refused rather than reported as worthless', () => {
-  assert.throws(() => valueInShards(100n, 'BTC', 0n), RangeError)
+  assert.throws(() => valueInCents(100n, 'BTC', 0n), RangeError)
 })
 
-test('buying then valuing never returns more Shards than were spent', () => {
+test('buying then valuing never returns more cents than were spent', () => {
   // The property that matters for a rebalance loop: round-tripping must not manufacture value, or a
   // bot could rebalance itself rich one rounding step at a time.
   const price = 27_345n * RATE_SCALE + 123_456n
   for (const spend of [1n, 7n, 999n, 100_000n, 3_000_000n]) {
-    const units = unitsForShards(spend, 'BTC', price)
-    assert.ok(valueInShards(units, 'BTC', price) <= spend, `round trip of ${spend} manufactured value`)
+    const units = unitsForCents(spend, 'BTC', price)
+    assert.ok(valueInCents(units, 'BTC', price) <= spend, `round trip of ${spend} manufactured value`)
   }
 })
 
@@ -104,9 +106,109 @@ test('a performance fee is zero below the high-water mark, so a recovery is neve
 })
 
 test('a performance fee under the floor is zero, so a settlement history is not buried in noise', () => {
-  // A 30-Shard gain at 15% is 4.5 → 4 Shards, which is under MIN_FEE_SHARDS.
+  // A 30-cent gain at 15% is 4.5 → 4 cents, which is under MIN_FEE_CENTS.
   assert.equal(performanceFee(1_030n, 1_000n, 1_500), 0n)
-  assert.ok(performanceFee(1_040n, 1_000n, 1_500) >= MIN_FEE_SHARDS)
+  assert.ok(performanceFee(1_040n, 1_000n, 1_500) >= MIN_FEE_CENTS)
+})
+
+/* ═════════════════════ micro-org#418: the re-denomination is the identity ═════════════════════
+ *
+ * micro-trade called its unit a "Shard" until SHARD was retired (`RETIRED_ASSETS`,
+ * `contracts/packages/chain/src/index.ts`). It was always a US cent — the peg is fixed at 100 to
+ * the dollar and SHARD carries `decimals: 0` — so the change was a rename and NOT a re-basing.
+ *
+ * That claim is only worth anything if something checks it. These three do, in the direction that
+ * would fail if somebody ever "tidied" the arithmetic while renaming it: a re-denomination that
+ * moves a single number is a bug, not a rename.
+ */
+
+test('the peg is 100 and is imported, so the identity cannot drift from contracts', () => {
+  // If this is ever not 100, a Shard stopped being a cent and NOTHING in this file's claim holds —
+  // including the stored columns, which were never converted. Re-read `src/money.ts` before
+  // changing it; the fix is a migration, not an edit here.
+  assert.equal(CENTS_PER_USD, 100n)
+})
+
+test('every figure in this service is unchanged to the digit by micro-org#418', () => {
+  // The exact values that were asserted against these functions under their old names, kept as
+  // literals rather than recomputed. Recomputing them would make this test agree with whatever the
+  // code does today, which is the one thing it must not do.
+  //
+  //   valueInShards → valueInCents, unitsForShards → unitsForCents, MIN_FEE_SHARDS → MIN_FEE_CENTS
+  assert.equal(valueInCents(100_000_000n, 'BTC', 30_000n * RATE_SCALE), 3_000_000n)
+  assert.equal(valueInCents(1n, 'BTC', 30_000n * RATE_SCALE), 0n)
+  assert.equal(equityOf(1_000n, 100_000_000n, 'BTC', 30_000n * RATE_SCALE), 3_001_000n)
+  assert.equal(performanceFee(11_000n, 10_000n, 1_500), 150n)
+  assert.equal(MIN_FEE_CENTS, 5n)
+
+  // 3,000,000 of this unit is $30,000.00 — the same money "3,000,000 Shards" named. The assertion
+  // is written as the conversion so that a reader can check the claim rather than take it.
+  assert.equal(valueInCents(100_000_000n, 'BTC', 30_000n * RATE_SCALE) / CENTS_PER_USD, 30_000n)
+})
+
+test('a cent amount buys the same units a Shard amount bought, at the same price', () => {
+  // `unitsForCents` still calls contracts-chain's `coinAmountForShards` on purpose — the peg makes
+  // it the correct arithmetic, and its USD-cents replacement THROWS on a zero result where this
+  // service needs `0n` to mean "nothing affordable" (see `src/money.ts`). That zero is asserted
+  // here, because a swap that looked like a cleanup would turn a routine tick into an exception.
+  const price = 27_345n * RATE_SCALE + 123_456n
+  assert.equal(unitsForCents(0n, 'BTC', price), 0n)
+  assert.equal(unitsForCents(1n, 'BTC', price), 36n, 'one cent buys 36 satoshis at $27,345.123456')
+  assert.equal(unitsForCents(3_000_000n, 'BTC', 30_000n * RATE_SCALE), 100_000_000n)
+
+  // The zero that must stay a zero rather than becoming a throw. A price high enough that a whole
+  // cent does not reach one satoshi is the case `planRebalance` meets whenever a bot is nearly out
+  // of cash: it reads `qty <= 0n`, records `no_signal`, and ticks on.
+  assert.equal(unitsForCents(1n, 'BTC', 10n ** 20n), 0n)
+})
+
+test('a backtest stored before the rename still reports its fees, rather than a blank', () => {
+  // THE DEFECT THIS EXISTS TO PREVENT. `metrics` and `trades` are jsonb written from the field
+  // names, so renaming the interfaces left every already-completed run carrying the old keys. The
+  // fixture below is literally what a pre-micro-org#418 row holds; if the reader is deleted this
+  // test fails, and if it is not, the customer's screen shows nothing where the fee used to be.
+  const stored = renameStoredMoneyKeys({
+    startEquity: '1000000',
+    feesPaidShards: '1500',
+    bestTradeShards: '20000',
+    worstTradeShards: '-8000',
+    trades: 12,
+  }) as Record<string, unknown>
+
+  assert.equal(stored['feesPaidUsdCents'], '1500', 'the fee is readable under its new name')
+  assert.equal(stored['bestTradeUsdCents'], '20000')
+  assert.equal(stored['worstTradeUsdCents'], '-8000')
+  assert.equal(stored['feesPaidShards'], undefined, 'and not under the old one as well')
+
+  // Untouched: the value is the same digits, and every non-money key is passed straight through.
+  assert.equal(stored['startEquity'], '1000000')
+  assert.equal(stored['trades'], 12)
+
+  // A fill written before the rename, which is the array element the result route serves.
+  const fill = renameStoredMoneyKeys({
+    side: 'sell',
+    qty: '100',
+    notionalShards: '3000',
+    feeShards: '3',
+    pnlShards: '-42',
+  }) as Record<string, unknown>
+  assert.equal(fill['notionalUsdCents'], '3000')
+  assert.equal(fill['feeUsdCents'], '3')
+  assert.equal(fill['pnlUsdCents'], '-42', 'a negative realised pnl survives, sign and all')
+  assert.equal(fill['side'], 'sell')
+})
+
+test('a result written after the rename is returned unchanged, and never double-renamed', () => {
+  const fresh = { feesPaidUsdCents: '99', trades: 1 }
+  assert.equal(renameStoredMoneyKeys(fresh), fresh, 'the same object, not a rebuilt copy')
+
+  // The one ambiguous row: both keys present, which only a half-finished migration could produce.
+  // The NEW key wins, because it is the one this service wrote.
+  const both = renameStoredMoneyKeys({ feesPaidShards: '1', feesPaidUsdCents: '2' }) as Record<string, unknown>
+  assert.equal(both['feesPaidUsdCents'], '2')
+
+  // `metrics` is null until a run completes, and null must not become an object.
+  assert.equal(renameStoredMoneyKeys(null), null)
 })
 
 test('a performance fee is a rounded-down share of the gain above the mark', () => {
@@ -389,7 +491,7 @@ test('an empty series produces no signals rather than throwing', () => {
 /* ------------------------------------------------------------------ performance */
 
 test('max drawdown is measured in exact basis points, so a small fall on a large equity survives', () => {
-  // A 1-Shard fall on 1,000,000 is 0.0001 — which is 1 bp, and a float computation of it against a
+  // A one-cent fall on 1,000,000 is 0.0001 — which is 1 bp, and a float computation of it against a
   // large peak is where the frozen version loses it entirely.
   assert.equal(maxDrawdownBps([1_000_000n, 999_900n, 1_000_000n]), 1n)
   assert.equal(maxDrawdownBps([100n, 50n]), 5_000n)
@@ -407,13 +509,13 @@ test('a run with no losing trade reports a profit factor of zero, because it has
       { t: 3_600, equity: 1_100n, hold: 1_000n, priceScaled: RATE_SCALE },
     ],
     fills: [
-      { t: 0, side: 'sell', priceScaled: RATE_SCALE, qty: 1n, notionalShards: 100n, feeShards: 0n, pnlShards: 100n, reason: 'x' },
+      { t: 0, side: 'sell', priceScaled: RATE_SCALE, qty: 1n, notionalUsdCents: 100n, feeUsdCents: 0n, pnlUsdCents: 100n, reason: 'x' },
     ],
     timeframe: '1h',
     startEquity: 1_000n,
     barsHeld: 1,
     barsTotal: 2,
-    feesPaidShards: 0n,
+    feesPaidUsdCents: 0n,
   })
   assert.equal(metrics.profitFactorBps, 0n)
   assert.equal(metrics.losses, 0)
@@ -421,16 +523,16 @@ test('a run with no losing trade reports a profit factor of zero, because it has
   assert.equal(metrics.exposureBps, 5_000n)
 })
 
-test('performance totals are bigint throughout, so a long run leaks no Shard', () => {
-  // A hundred alternating one-Shard wins and losses must net to exactly zero, not to 1e-13.
+test('performance totals are bigint throughout, so a long run leaks no cent', () => {
+  // A hundred alternating one-cent wins and losses must net to exactly zero, not to 1e-13.
   const fills = Array.from({ length: 100 }, (_, i) => ({
     t: i,
     side: 'sell' as const,
     priceScaled: RATE_SCALE,
     qty: 1n,
-    notionalShards: 1n,
-    feeShards: 0n,
-    pnlShards: i % 2 === 0 ? 1n : -1n,
+    notionalUsdCents: 1n,
+    feeUsdCents: 0n,
+    pnlUsdCents: i % 2 === 0 ? 1n : -1n,
     reason: 'x',
   }))
   const metrics = computeMetrics({
@@ -440,12 +542,12 @@ test('performance totals are bigint throughout, so a long run leaks no Shard', (
     startEquity: 1_000n,
     barsHeld: 0,
     barsTotal: 100,
-    feesPaidShards: 0n,
+    feesPaidUsdCents: 0n,
   })
   assert.equal(metrics.wins, 50)
   assert.equal(metrics.losses, 50)
-  assert.equal(metrics.bestTradeShards, 1n)
-  assert.equal(metrics.worstTradeShards, -1n)
+  assert.equal(metrics.bestTradeUsdCents, 1n)
+  assert.equal(metrics.worstTradeUsdCents, -1n)
   // 50 profit over 50 loss, exactly break-even, exactly 10000 bps.
   assert.equal(metrics.profitFactorBps, 10_000n)
 })
@@ -458,7 +560,7 @@ test('an empty run reports its start equity as its end equity rather than zero',
     startEquity: 5_000n,
     barsHeld: 0,
     barsTotal: 0,
-    feesPaidShards: 0n,
+    feesPaidUsdCents: 0n,
   })
   assert.equal(metrics.endEquity, 5_000n)
   assert.equal(metrics.totalReturnBps, 0n)
@@ -472,9 +574,9 @@ test('a buy fill balances per asset, which is the only thing the ledger will acc
     userId: ALICE_ID,
     asset: 'BTC',
     side: 'buy',
-    notionalShards: 1_000n,
+    notionalUsdCents: 1_000n,
     units: 33_000n,
-    feeShards: 10n,
+    feeUsdCents: 10n,
   })
   assertBalancedPerAsset(postings)
 })
@@ -484,9 +586,9 @@ test('a sell fill balances per asset too, with the directions mirrored', () => {
     userId: ALICE_ID,
     asset: 'BTC',
     side: 'sell',
-    notionalShards: 1_000n,
+    notionalUsdCents: 1_000n,
     units: 33_000n,
-    feeShards: 10n,
+    feeUsdCents: 10n,
   })
   assertBalancedPerAsset(postings)
   assert.equal(postings[0]?.direction, 'debit')
@@ -498,15 +600,15 @@ test('a fill with no fee posts no fee legs at all, rather than two zero-amount o
     userId: ALICE_ID,
     asset: 'BTC',
     side: 'buy',
-    notionalShards: 1_000n,
+    notionalUsdCents: 1_000n,
     units: 33_000n,
-    feeShards: 0n,
+    feeUsdCents: 0n,
   })
   assert.equal(postings.length, 4)
 })
 
 test('a performance fee debits the user and credits platform revenue, and balances', () => {
-  const postings = performanceFeePostings({ userId: ALICE_ID, amountShards: 250n })
+  const postings = performanceFeePostings({ userId: ALICE_ID, amountUsdCents: 250n })
   assertBalancedPerAsset(postings)
   assert.equal(postings[1]?.account.subject, 'platform')
   assert.equal(postings[1]?.account.purpose, 'fees')
@@ -535,9 +637,9 @@ test('a performance fee debits the user and credits platform revenue, and balanc
  * Pure, so it runs in CI with no database — which is what the defect it covers never had.
  */
 test('every subject a money posting names is one micro-ledger can parse', () => {
-  const buy = fillPostings({ userId: ALICE_ID, asset: 'BTC', side: 'buy', notionalShards: 1_000n, units: 33_000n, feeShards: 10n })
-  const sell = fillPostings({ userId: ALICE_ID, asset: 'BTC', side: 'sell', notionalShards: 1_000n, units: 33_000n, feeShards: 10n })
-  const fee = performanceFeePostings({ userId: ALICE_ID, amountShards: 250n })
+  const buy = fillPostings({ userId: ALICE_ID, asset: 'BTC', side: 'buy', notionalUsdCents: 1_000n, units: 33_000n, feeUsdCents: 10n })
+  const sell = fillPostings({ userId: ALICE_ID, asset: 'BTC', side: 'sell', notionalUsdCents: 1_000n, units: 33_000n, feeUsdCents: 10n })
+  const fee = performanceFeePostings({ userId: ALICE_ID, amountUsdCents: 250n })
   for (const posting of [...buy, ...sell, ...fee]) {
     assert.doesNotThrow(
       () => parseAccountSubject(posting.account.subject),
@@ -549,9 +651,9 @@ test('every subject a money posting names is one micro-ledger can parse', () => 
 test('an id that would collide two accounts onto one key is refused rather than posted', () => {
   // `accountKey` joins subject and asset on `|`, and a subject is `user:<id>`, so an id carrying
   // either delimiter is one that can name somebody else's account.
-  assert.throws(() => fillPostings({ userId: 'a:b', asset: 'BTC', side: 'buy', notionalShards: 1n, units: 1n, feeShards: 0n }), RangeError)
-  assert.throws(() => performanceFeePostings({ userId: 'a|b', amountShards: 1n }), RangeError)
-  assert.throws(() => performanceFeePostings({ userId: '', amountShards: 1n }), RangeError)
+  assert.throws(() => fillPostings({ userId: 'a:b', asset: 'BTC', side: 'buy', notionalUsdCents: 1n, units: 1n, feeUsdCents: 0n }), RangeError)
+  assert.throws(() => performanceFeePostings({ userId: 'a|b', amountUsdCents: 1n }), RangeError)
+  assert.throws(() => performanceFeePostings({ userId: '', amountUsdCents: 1n }), RangeError)
 })
 
 test('a settlement key is derived from the bot and the period, never from a random row id', () => {
