@@ -210,7 +210,10 @@ const EMIT_SITES = Object.freeze({
   'trade.bot.created': { file: 'bots.ts', key: 'bot.id', keyedBy: 'bot_id' },
   'trade.bot.started': { file: 'bots.ts', key: 'bot.id', keyedBy: 'bot_id' },
   'trade.bot.paused': { file: 'bots.ts', key: 'bot.id', keyedBy: 'bot_id' },
-  'trade.fill.settled': { file: 'fills.ts', key: 'value.fill.id', keyedBy: 'fill_id' },
+  // `fill.id`, not `value.fill.id`, since micro-org#367 moved the emit INSIDE `applyFill`'s
+  // transaction — the row is in scope there and the post-commit `value` wrapper is gone. Same
+  // aggregate, so the registry entry did not move.
+  'trade.fill.settled': { file: 'fills.ts', key: 'fill.id', keyedBy: 'fill_id' },
   'trade.fee.settled': { file: 'fees.ts', key: 'row.id', keyedBy: 'settlement_id' },
   'trade.order.filled': { file: 'exchange.ts', key: 'order.id', keyedBy: 'order_id' },
   'trade.transfer.settled': { file: 'transfers.ts', key: 'transfer.id', keyedBy: 'transfer_id' },

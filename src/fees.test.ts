@@ -33,7 +33,8 @@ import {
   type FakeLedger,
   type TestClock,
 } from './testsupport.ts'
-import type { Db } from './outbox.ts'
+import { withOutbox, type Db } from './outbox.ts'
+import { SERVICE } from './topics.ts'
 
 let sql: postgres.Sql
 let db: Db
@@ -347,6 +348,55 @@ test('a short wallet is charged what it can cover, under the same key and not a 
   const after = await getBot(db, bot.id)
   assert.equal(after?.feePaid, 6_000n)
   assert.equal(after?.feeOwed, 9_000n, 'the uncollected remainder was not carried')
+})
+
+/**
+ * A partial collection is a different fact from a full one, and it says so — micro-org#367.
+ *
+ * ## The mutation this kills
+ *
+ * A CONSTANT status on the emit. `status: 'charged'` for every collection is exactly what the
+ * payload said implicitly before this, by carrying no status at all: `{ settlementId, botId,
+ * period, collected, entryId }` is byte-identical whether the wallet covered the whole fee or a
+ * twentieth of it, and both `activity` and `notify` wrote that limit into their own rules on
+ * 2026-08-10 rather than hedging the copy. Any revenue figure built on this topic would read
+ * `collected` as the assessment and overstate what the platform is owed the moment one wallet
+ * comes up short.
+ *
+ * ONE case cannot kill that mutation, which is why there are two here and why they share
+ * everything but the balance. A test that drove only the short wallet dies to `status: 'partial'`
+ * hard-coded; one that drove only the full wallet dies to `'charged'`. The pair pins the field to
+ * the settlement it describes.
+ *
+ * It is driven through `withOutbox` and read back out of the `outbox` TABLE — the exact shape
+ * `jobs.ts`'s settle handler uses — so it also kills deleting the emit outright, which a spy on
+ * `emit` would not: the fill emit on this service was optional and unpassed for a fortnight while
+ * every suite stayed green.
+ */
+test('a partial fee collection says so on the wire, and a full one says something else', { skip }, async () => {
+  const full = await aBot(1_100_000n)
+  const short = await aBot(1_100_000n)
+
+  await withOutbox(db, SERVICE, async (_tx, emit) => settle(deps(), full, 'assess', emit))
+  // The only difference between the two settlements. 15,000 Shards are due on each.
+  ledger.setBalance(ALICE, 6_000n)
+  await withOutbox(db, SERVICE, async (_tx, emit) => settle(deps(), short, 'assess', emit))
+
+  const rows = await sql<{ payload: Record<string, unknown> }[]>`
+    select payload from outbox where topic = 'trade.fee.settled' order by occurred_at asc
+  `
+  assert.equal(rows.length, 2, 'a fee left a balance and the estate was told nothing')
+  const [charged, partial] = rows.map((row) => row.payload)
+
+  assert.equal(charged?.['status'], 'charged')
+  assert.equal(charged?.['collected'], '15000')
+  assert.equal(charged?.['due'], '15000')
+
+  assert.equal(partial?.['status'], 'partial')
+  assert.equal(partial?.['collected'], '6000')
+  // `due` is what makes the shortfall computable by a consumer that holds no settlement row. The
+  // reverse is not derivable, which is why the assessment is sent rather than the remainder.
+  assert.equal(partial?.['due'], '15000')
 })
 
 test('a balance the ledger will not report defers, rather than being read as zero', { skip }, async () => {

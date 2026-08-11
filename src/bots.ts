@@ -31,6 +31,7 @@
 
 import { Logger } from '@cloudsforge/telemetry'
 import type { AssetCode } from '@cloudsforge/contracts-chain'
+import { userSubject } from '@cloudsforge/contracts-money'
 import {
   BPS_SCALE,
   applyBps,
@@ -498,17 +499,34 @@ export async function tickBot(
         } else if (bot.mode === 'paper') {
           // No ledger call: a paper fill moves imaginary money, and posting it would put a
           // simulation in the journal.
-          const applied = await applyFill(deps.sql, booked.id, {
-            priceScaled: planned.priceScaled,
-            qty: planned.qty,
-            shards: planned.shards,
-            feeShards: planned.feeShards,
-            entryId: null,
-          })
+          // The event goes out for a paper fill too, and that is deliberate rather than an
+          // oversight of the "no ledger call" rule above. `activity`'s classifier discriminates on
+          // `entryId` — null is a paper fill and it says "No real money moved" — so withholding the
+          // paper half would leave a user's own timeline unable to show the bot they are watching
+          // do the only thing it does. Nothing here reaches the journal; the outbox is not the
+          // journal.
+          const applied = await applyFill(
+            deps.sql,
+            booked.id,
+            {
+              priceScaled: planned.priceScaled,
+              qty: planned.qty,
+              shards: planned.shards,
+              feeShards: planned.feeShards,
+              entryId: null,
+            },
+            deps.producer,
+          )
           verdict = applied.status === 'applied' ? 'filled' : 'already_filled'
         } else {
           const outcome = await settleFill(
-            { sql: deps.sql, ledger: deps.ledger, asset, correlationId: deps.correlationId },
+            {
+              sql: deps.sql,
+              ledger: deps.ledger,
+              asset,
+              correlationId: deps.correlationId,
+              producer: deps.producer,
+            },
             booked,
           )
           if (outcome.status === 'applied') verdict = 'filled'
@@ -567,7 +585,9 @@ export async function startBot(
   if (bot.mode === 'live' && reservationId === null) {
     const { allocationIdempotencyKey } = await import('./ledgerclient.ts')
     const reservation = await deps.ledger.reserve({
-      subject: `user:${bot.userId}`,
+      // The contract's constructor, not a template literal: it is the same grammar micro-org#372
+      // was about, and it refuses an id that would collide two accounts onto one key.
+      subject: userSubject(bot.userId),
       assetCode: 'SHARD',
       amount: bot.allocation,
       actor: 'service:trade',

@@ -21,6 +21,8 @@ import {
   type PlannedFill,
 } from './fills.ts'
 import { fillIdempotencyKey } from './ledgerclient.ts'
+import { SERVICE } from './topics.ts'
+import { buildEnvelope } from './outbox.ts'
 import { amountFrom } from './money.ts'
 import {
   ALICE,
@@ -100,7 +102,7 @@ async function botState(): Promise<{ cash: bigint; position: bigint }> {
   return { cash: amountFrom(row.cash), position: amountFrom(row.position) }
 }
 
-const deps = () => ({ sql: db, ledger, asset: 'BTC' as const, correlationId: 'req-1' })
+const deps = () => ({ sql: db, ledger, asset: 'BTC' as const, correlationId: 'req-1', producer: SERVICE })
 
 /* ------------------------------------------------------------------ booking */
 
@@ -277,13 +279,18 @@ test('a settled fill records the entry that settled it, so a retry is answerable
 test('a paper fill settles with no ledger entry, because a simulation must not reach the journal', { skip }, async () => {
   const fill = await bookFill(db, planned({ mode: 'paper' }))
   assert.ok(fill)
-  const result = await applyFill(db, fill.id, {
-    priceScaled: fill.priceScaled,
-    qty: fill.qty,
-    shards: fill.shards,
-    feeShards: fill.feeShards,
-    entryId: null,
-  })
+  const result = await applyFill(
+    db,
+    fill.id,
+    {
+      priceScaled: fill.priceScaled,
+      qty: fill.qty,
+      shards: fill.shards,
+      feeShards: fill.feeShards,
+      entryId: null,
+    },
+    SERVICE,
+  )
   assert.equal(result.status, 'applied')
   assert.equal(ledger.entries.length, 0, 'a simulation must not reach the journal')
 })

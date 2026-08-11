@@ -41,8 +41,8 @@ import {
   fillPostings,
   type LedgerClient,
 } from './ledgerclient.ts'
+import { withOutbox, type Db, type Tx } from './outbox.ts'
 import type { AssetCode } from '@cloudsforge/contracts-chain'
-import type { Db, Emit, Tx } from './outbox.ts'
 
 export type FillSide = 'buy' | 'sell'
 export type FillMode = 'paper' | 'live'
@@ -183,14 +183,36 @@ export type ApplyResult =
  * (`crucible/services/crucible/src/runner.ts`), so a crash after the ledger moved and before
  * that write leaves money moved and a mirror that says it did not — permanently, because the bar
  * pointer has advanced past it.
+ *
+ * ## `producer`, not an optional `emit` — micro-org#367
+ *
+ * This took `emit?: Emit` from the day `trade.fill.settled` was registered, and NEITHER of
+ * `tickBot`'s two call sites — the paper branch and the live one — ever passed one. Measured
+ * 2026-08-11: `trade.fill.settled` is in `EMITTED_TOPICS`, in the shared registry, in `activity`'s
+ * classifier table and in `notify`'s recorded-no list, and the mainnet `trade.outbox` held zero
+ * rows on it. A registered topic nothing emits is a claim the estate cannot honour, and an OPTIONAL
+ * emit is a claim any call site can drop in silence. Requiring the producer name makes forgetting
+ * it a compile error.
+ *
+ * The event is written INSIDE the claiming transaction rather than after it, which is rule 5 of
+ * 03 §2 and not a preference: the old shape published after `sql.begin` had already committed, so a
+ * process that died in the gap moved the bot's cash and position and told nobody, for ever. There
+ * is no second transaction here to write the row into, so `withOutbox` owns the whole claim.
+ *
+ * The payload carries `userId` because the envelope alone cannot. `activity`'s classifier reads
+ * `userFromPayload` for this topic and says why: the emit's actor used to be absent, so
+ * `buildEnvelope` fell back to `service:trade` and every fill was a record attributable to nobody.
+ * Both halves are sent now — the payload names the owner and the actor is that owner — because
+ * `userFromPayload` and `userFromActor` are separate readers in separate consumers and each has to
+ * find its own answer without querying a database.
  */
 export async function applyFill(
   sql: Db,
   fillId: string,
   outcome: FillOutcome,
-  emit?: Emit,
+  producer: string,
 ): Promise<ApplyResult> {
-  const result = await sql.begin(async (tx) => {
+  return withOutbox(sql, producer, async (tx, emit) => {
     const rows = await tx<FillRow[]>`
       update fills
          set status       = 'settled',
@@ -206,7 +228,7 @@ export async function applyFill(
       returning ${tx.unsafe(COLUMNS)}
     `
     const row = rows[0]
-    if (!row) return { value: { status: 'already' } as ApplyResult }
+    if (!row) return { status: 'already' } as ApplyResult
     const fill = toFill(row)
 
     // The signed `shards` and the side together are the whole movement. A buy spends Shards and
@@ -219,24 +241,25 @@ export async function applyFill(
              position = position + ${unitsDelta.toString()}::numeric
        where id = ${fill.botId}
     `
-    return { value: { status: 'applied', fill } as ApplyResult }
-  })
-  const value = result.value
-  if (value.status === 'applied' && emit) {
     emit({
       topic: 'trade.fill.settled',
-      key: value.fill.id,
+      key: fill.id,
       payload: {
-        fillId: value.fill.id,
-        botId: value.fill.botId,
-        side: value.fill.side,
-        qty: value.fill.qty.toString(),
-        shards: value.fill.shards.toString(),
-        entryId: value.fill.entryId,
+        fillId: fill.id,
+        botId: fill.botId,
+        userId: fill.userId,
+        side: fill.side,
+        qty: fill.qty.toString(),
+        shards: fill.shards.toString(),
+        entryId: fill.entryId,
       },
+      // The OWNER off the fill row, never a caller: nothing reaches this function from a request,
+      // and the row is the only place the bot's user is known for certain. Same argument the fee
+      // emit makes, and the reason `notify` may read an actor at all.
+      actor: `user:${fill.userId}`,
     })
-  }
-  return value
+    return { status: 'applied', fill } as ApplyResult
+  })
 }
 
 /** Record that the ledger refused. Nothing moved and nothing will; the bar is done. */
@@ -267,6 +290,8 @@ export interface SettleFillDeps {
   readonly ledger: LedgerClient
   readonly asset: AssetCode
   readonly correlationId: string
+  /** Stamped on the outbox row `applyFill` writes. Required, so no call site can drop the event. */
+  readonly producer: string
 }
 
 /**
@@ -276,7 +301,7 @@ export interface SettleFillDeps {
  * repeat replays; and `applyFill` claims the row, so a repeat that finds it already applied moves
  * nothing. That is the property the concurrency test drives.
  */
-export async function settleFill(deps: SettleFillDeps, fill: FillRecord, emit?: Emit): Promise<ApplyResult | { status: 'refused' | 'unresolved'; reason: string }> {
+export async function settleFill(deps: SettleFillDeps, fill: FillRecord): Promise<ApplyResult | { status: 'refused' | 'unresolved'; reason: string }> {
   const notional = fill.shards < 0n ? -fill.shards : fill.shards
   try {
     const entry = await deps.ledger.postEntry({
@@ -304,7 +329,7 @@ export async function settleFill(deps: SettleFillDeps, fill: FillRecord, emit?: 
         feeShards: fill.feeShards,
         entryId: entry.id,
       },
-      emit,
+      deps.producer,
     )
   } catch (err) {
     if (err instanceof LedgerRefusedError) {
