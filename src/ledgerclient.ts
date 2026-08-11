@@ -42,7 +42,8 @@
 
 import { HttpClient, HttpError } from '@cloudsforge/http'
 import type { AssetCode } from '@cloudsforge/contracts-chain'
-import type { Actor, EntryKind, LedgerAssetCode } from '@cloudsforge/contracts-money'
+import { userSubject } from '@cloudsforge/contracts-money'
+import type { AccountSubject, Actor, EntryKind, LedgerAssetCode } from '@cloudsforge/contracts-money'
 import type { LiveScope } from '@cloudsforge/contracts-auth'
 
 /**
@@ -106,8 +107,30 @@ export class LedgerInFlightError extends Error {
   }
 }
 
+/**
+ * An account at the ledger.
+ *
+ * ## `subject` is `AccountSubject`, and that is the durable half of micro-org#372
+ *
+ * It was `string`. `transferPostings` spelled the escrow leg `subject: 'exchange'` from the day the
+ * order book shipped, the estate's grammar had no such subject, and every posting the function made
+ * would have died at `parseAccountSubject` inside the ledger's `ensureAccount` — in both
+ * directions, for every asset, after `bookTransfer` had already debited the customer's available
+ * balance in its own transaction. It surfaced as a red `estate-ci` sweep and not as a type error,
+ * because `string` is what a subject was declared to be here.
+ *
+ * Registering `exchange` in `contracts-money` and importing `EXCHANGE` fixed THAT line. It did not
+ * fix the property that let it through: five more subject literals live in this file and in
+ * `bots.ts`, and every one of them was equally free to be wrong. Naming the contract's own union
+ * here is what makes the next invented subject a `pnpm typecheck` failure rather than a posting
+ * that dies at the far end of the estate. The union admits `user:${string}` and the four
+ * singletons, so no correct call site had to change.
+ *
+ * Measured 2026-08-11: zero rows in mainnet `trade.exchange_transfers` and no `exchange`-subject
+ * account in the mainnet ledger, so nothing was ever posted under the wrong spelling.
+ */
 export interface AccountRef {
-  readonly subject: string
+  readonly subject: AccountSubject
   readonly assetCode: LedgerAssetCode
   readonly purpose: 'available' | 'reserved' | 'escrow' | 'treasury' | 'fees' | 'payout_due' | 'suspense'
   readonly type: 'liability' | 'asset' | 'revenue' | 'expense' | 'equity' | 'clearing'
@@ -139,7 +162,8 @@ export interface PostedEntry {
 }
 
 export interface ReserveRequest {
-  readonly subject: string
+  /** Same union as `AccountRef.subject`, for the same reason — a reservation names an account too. */
+  readonly subject: AccountSubject
   readonly assetCode: LedgerAssetCode
   readonly amount: bigint
   readonly actor: Actor
@@ -167,9 +191,16 @@ export interface LedgerClient {
   availableShards(userId: string): Promise<bigint | null>
 }
 
-/* ------------------------------------------------------------------ the postings */
-
-const userSubject = (userId: string): string => `user:${userId}`
+/* ------------------------------------------------------------------ the postings
+ *
+ * `userSubject` is the CONTRACT's, imported above — micro-org#372's second half. This file and
+ * `transfers.ts` each carried a local `(id) => \`user:${id}\`` returning `string`. Two hand-rolled
+ * spellings of a grammar that lives somewhere else is exactly the shape that put
+ * `subject: 'exchange'` on the wire, and the imported one additionally REFUSES an id containing
+ * `:` or `|` — which `accountKey` joins on, so an id carrying one would let two distinct accounts
+ * produce a single key. That is the quietest possible way to merge two customers' balances, and no
+ * local one-liner has ever checked for it.
+ */
 
 /**
  * The postings that settle a fill.

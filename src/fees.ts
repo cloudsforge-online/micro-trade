@@ -526,6 +526,29 @@ export async function settle(
   await updateBot(deps.sql, bot.id, { feePaid: feePaid + collected, feeOwed: due - collected })
 
   if (collected > 0n) {
+    // ── WHAT `status` AND `due` ARE DOING HERE — micro-org#367 ───────────────────────────────────
+    //
+    // The payload used to be `{ settlementId, botId, period, collected, entryId }`, and a PARTIAL
+    // collection was byte-identical to a full one: `collected` alone says how much arrived and
+    // nothing says how much was owed, so no consumer could tell "we took the fee" from "we took
+    // what your balance could cover and you still owe the rest". Both `activity` and `notify`
+    // wrote that limit down against their own rules on 2026-08-10 rather than hedging their copy,
+    // and both are waiting on this field: the mail this topic sends says the fee was charged, in
+    // all three cases.
+    //
+    // `due` and not `outstanding`, because `due - collected` is derivable and the reverse is not:
+    // a consumer that wants the shortfall can subtract, and one that wants to know whether the
+    // whole assessment landed needs the assessment. Both are Shard counts in smallest units, which
+    // is why the SENTENCE a consumer builds has to come off `status` — `trade` is a
+    // smallest-units producer, so `money()` in activity declines to render either figure and a
+    // template that tried would print a number eighteen orders of magnitude out.
+    //
+    // The `collected > 0n` guard STAYS, and `uncollectable` is therefore a status this emit can
+    // never carry. That is not the same defect wearing a different hat: an uncollectable
+    // settlement moved no money, `notify`'s live rule renders this topic as "a performance fee was
+    // charged", and publishing a charge that did not happen is worse than publishing nothing. The
+    // fact that a bot is in arrears is a different fact and wants a topic of its own — filed on
+    // micro-org#367 rather than smuggled in under this name.
     emit?.({
       topic: 'trade.fee.settled',
       key: row.id,
@@ -534,6 +557,8 @@ export async function settle(
         botId: bot.id,
         period: period.toString(),
         collected: collected.toString(),
+        due: due.toString(),
+        status,
         entryId,
       },
       actor: `user:${bot.userId}`,

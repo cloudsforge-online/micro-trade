@@ -34,7 +34,7 @@
  */
 
 import { CHAINS, RETIRED_ASSETS, type AssetCode } from '@cloudsforge/contracts-chain'
-import { EXCHANGE } from '@cloudsforge/contracts-money'
+import { EXCHANGE, userSubject } from '@cloudsforge/contracts-money'
 import { amountFrom } from './money.ts'
 import { credit, debitAvailable, type Balance } from './accounts.ts'
 import {
@@ -108,8 +108,6 @@ export const toTransfer = (row: TransferRow): TransferRecord => ({
 
 /** `trade:xfer:<row id>`. Derived, so a retry of one row replays rather than moving money twice. */
 export const transferIdempotencyKey = (transferId: string): string => `trade:xfer:${transferId}`
-
-const userSubject = (userId: string): string => `user:${userId}`
 
 /**
  * The postings a transfer makes.

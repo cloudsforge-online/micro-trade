@@ -32,6 +32,7 @@ import { STRATEGIES, TIMEFRAME_SECONDS, findStrategy, isStrategyId, isTimeframe,
 import { compileSignals } from './strategies.ts'
 import { computeMetrics, maxDrawdownBps, ratioBps } from './performance.ts'
 import { fillPostings, performanceFeePostings, settlementIdempotencyKey, fillIdempotencyKey } from './ledgerclient.ts'
+import { parseAccountSubject } from '@cloudsforge/contracts-money'
 import { requestFingerprint } from './idempotency.ts'
 import { assertIngestable, stalenessIntervals, BarRejectedError } from './series.ts'
 import { makeBars } from './testsupport.ts'
@@ -509,6 +510,48 @@ test('a performance fee debits the user and credits platform revenue, and balanc
   assertBalancedPerAsset(postings)
   assert.equal(postings[1]?.account.subject, 'platform')
   assert.equal(postings[1]?.account.purpose, 'fees')
+})
+
+/**
+ * Every subject the money postings name is one the ledger's grammar has — micro-org#372, the half
+ * the first fix did not reach.
+ *
+ * ## The mutations this kills
+ *
+ * **One:** widening `AccountRef.subject` back to `string`. `transferPostings` spelled its escrow leg
+ * `'exchange'` for the life of the order book and no compiler objected, because `string` is what a
+ * subject was declared to be. Registering `EXCHANGE` fixed that ONE literal and left the other five
+ * — the two `clearing` legs, `platform` twice, and the user wallets — equally free to be wrong.
+ * This walks all of them past the contract's own `parseAccountSubject`, which is the function
+ * micro-ledger's `ensureAccount` calls, so a subject the estate cannot read fails here rather than
+ * at the far end of a money write.
+ *
+ * **Two:** restoring the hand-rolled `` (id) => `user:${id}` `` this file's source used to carry in
+ * two copies. The contract's `userSubject` additionally refuses an id containing `:` or `|`, and
+ * `accountKey` joins on `|` — so an id carrying one lets two distinct accounts collapse onto a
+ * single key, which is the quietest possible way to merge two customers' balances. A local
+ * one-liner has never checked for it and a `subject: string` type never could.
+ *
+ * Pure, so it runs in CI with no database — which is what the defect it covers never had.
+ */
+test('every subject a money posting names is one micro-ledger can parse', () => {
+  const buy = fillPostings({ userId: ALICE_ID, asset: 'BTC', side: 'buy', notionalShards: 1_000n, units: 33_000n, feeShards: 10n })
+  const sell = fillPostings({ userId: ALICE_ID, asset: 'BTC', side: 'sell', notionalShards: 1_000n, units: 33_000n, feeShards: 10n })
+  const fee = performanceFeePostings({ userId: ALICE_ID, amountShards: 250n })
+  for (const posting of [...buy, ...sell, ...fee]) {
+    assert.doesNotThrow(
+      () => parseAccountSubject(posting.account.subject),
+      `${posting.account.subject} is not an account subject — ensureAccount throws on it and the entry dies at the ledger`,
+    )
+  }
+})
+
+test('an id that would collide two accounts onto one key is refused rather than posted', () => {
+  // `accountKey` joins subject and asset on `|`, and a subject is `user:<id>`, so an id carrying
+  // either delimiter is one that can name somebody else's account.
+  assert.throws(() => fillPostings({ userId: 'a:b', asset: 'BTC', side: 'buy', notionalShards: 1n, units: 1n, feeShards: 0n }), RangeError)
+  assert.throws(() => performanceFeePostings({ userId: 'a|b', amountShards: 1n }), RangeError)
+  assert.throws(() => performanceFeePostings({ userId: '', amountShards: 1n }), RangeError)
 })
 
 test('a settlement key is derived from the bot and the period, never from a random row id', () => {

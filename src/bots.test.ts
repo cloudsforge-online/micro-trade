@@ -51,7 +51,27 @@ import {
   type FakePricing,
   type TestClock,
 } from './testsupport.ts'
-import type { Db } from './outbox.ts'
+import { buildEnvelope, type Db } from './outbox.ts'
+import { envelopeDefects } from './topics.ts'
+
+/**
+ * The relay's own row shape, restated here because `outbox.ts` keeps it private.
+ *
+ * Structural, so `buildEnvelope` accepts it: the point of reading a REAL row back out of the table
+ * and building the envelope from it is that nothing in this file gets to invent what a producer
+ * sends. A fixture envelope proves a fixture.
+ */
+interface OutboxRow {
+  readonly id: string
+  readonly topic: string
+  readonly key: string
+  readonly occurred_at: Date
+  readonly producer: string
+  readonly version: number
+  readonly actor: string | null
+  readonly correlation_id: string | null
+  readonly payload: Record<string, unknown>
+}
 
 let sql: postgres.Sql
 let db: Db
@@ -214,6 +234,52 @@ test('a tick never writes cash or position itself, so a crash cannot desync the 
   assert.ok(after)
   assert.equal(after.cash, before.cash, 'cash moved without a settled fill')
   assert.equal(after.position, before.position, 'the position moved without a settled fill')
+})
+
+/**
+ * `trade.fill.settled` is emitted, and by the TICK — micro-org#367.
+ *
+ * ## The mutation this kills
+ *
+ * Restoring `applyFill(sql, id, outcome, emit?)` and dropping the argument at `tickBot`'s two call
+ * sites. That is precisely what shipped: the topic was registered, `activity` wrote a classifier
+ * for it, `notify` wrote down a decision against it, and on `main` not one had ever arrived —
+ * measured 2026-08-11, zero rows on `trade.fill.settled` in the mainnet `outbox`. A test that
+ * called `applyFill` directly with an emit would have stayed green through all of it, because
+ * `applyFill` emitting was never the thing in doubt. So this drives `tickBot` and reads the OUTBOX,
+ * which is the only place a caller's failure to ask for the event is visible.
+ *
+ * It kills two narrower mutations in the same breath: deleting `userId` from the payload, and
+ * deleting the `actor` from the emit. Both were absent on `main` and both are load-bearing in a
+ * different consumer — `activity` resolves this topic's owner with `userFromPayload` and `notify`
+ * resolves recipients from the envelope actor — so an assertion on one would leave the other free
+ * to regress. The envelope is built with the relay's own `buildEnvelope` and run past
+ * `envelopeDefects`, so "the estate can read it" is the contract's answer rather than this file's.
+ *
+ * Paper mode deliberately: it reaches the same `applyFill` with no ledger in the way, so a failure
+ * here is about the emit and never about a fake ledger's mood.
+ */
+test('a fill that settles reaches the bus, attributed to the bot owner rather than to the service', { skip }, async () => {
+  const bot = await aBot('paper')
+  const series = await getSeries(db, seriesId)
+  assert.ok(series)
+  assert.equal(await tickBot(tickDeps(), bot, series), 'filled')
+
+  const rows = await sql<OutboxRow[]>`
+    select id, topic, key, occurred_at, producer, version, actor, correlation_id, payload
+      from outbox where topic = 'trade.fill.settled'
+  `
+  assert.equal(rows.length, 1, 'the bot filled and the estate was told nothing')
+
+  const envelope = buildEnvelope(rows[0]!)
+  assert.equal(envelope.actor, `user:${ALICE}`, 'the envelope names nobody a consumer can deliver to')
+  assert.equal(envelope.payload['userId'], ALICE, 'activity reads the owner off the payload for this topic')
+  assert.equal(envelope.key, rows[0]!.payload['fillId'], 'the registry keys this topic by the fill')
+  assert.deepEqual(
+    envelopeDefects(JSON.parse(JSON.stringify(envelope))),
+    [],
+    'a fill event every consumer in the estate would refuse',
+  )
 })
 
 test('a bot that is not running does nothing when ticked', { skip }, async () => {
