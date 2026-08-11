@@ -57,15 +57,50 @@ export interface FillRecord {
   readonly mode: FillMode
   readonly priceScaled: bigint
   readonly qty: bigint
-  /** Shards moved, signed: negative on a buy, positive on a sell. */
-  readonly shards: bigint
-  readonly feeShards: bigint
+  /** US cents moved, signed: negative on a buy, positive on a sell. */
+  readonly usdCents: bigint
+  readonly feeUsdCents: bigint
   readonly reason: string
   readonly status: FillStatus
   readonly entryId: string | null
   readonly error: string | null
 }
 
+/**
+ * The row as postgres holds it — and THE ONE PLACE THE OLD COLUMN NAMES SURVIVE.
+ *
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * `shards` AND `fee_shards` ARE STILL THE COLUMN NAMES. THIS IS DELIBERATE, NOT AN OVERSIGHT.
+ *
+ * micro-org#418 re-denominated this service from Shards to US cents. It is the identity — the peg
+ * is 100 Shards to the dollar and SHARD has `decimals: 0`, so one Shard was exactly one cent and no
+ * stored number moved (`src/money.ts` argues it in full). Every field ABOVE, every JSON key on the
+ * wire and every label in micro-trade-web now says cents. These two columns do not, and a reader
+ * who finds them should know why rather than assume the migration was forgotten:
+ *
+ *   * **A rename is not free during a rollout.** The migrator runs BEFORE the new code starts, so
+ *     for the length of a deploy the old replicas are still inserting `shards`. `alter table …
+ *     rename column` makes every one of those a 500 the instant it lands — on the fill path, which
+ *     is where a bot's money moves. micro-mint's `retire_shard_pricing` makes the same argument for
+ *     why it would not put a NOT NULL on its new column.
+ *   * **The mint precedent does not transfer.** mint ADDED `price_usd_cents` beside `price_shards`
+ *     because its semantics genuinely changed: a USD quote and an EMBER charge are two different
+ *     numbers at a floating rate. Here there is one number and a fixed 1:1 peg, so a parallel
+ *     `usd_cents` column would hold a byte-identical copy of `shards` for ever — no new fact, two
+ *     writers, and a reconciliation question nobody asked for.
+ *
+ *   * **The DDL text can never be cleaned up either way.** `src/migrations.ts` is checksummed by
+ *     `@cloudsforge/db` and a released migration is immutable, so the `-- Shards moved, signed`
+ *     comment on the original `create table` stays on disk for ever whatever these columns are
+ *     called. A rename would leave that comment describing a column that no longer exists, which is
+ *     strictly worse to read than a stale name that at least still matches its own DDL.
+ *
+ * So the name is stale and the VALUE is exactly right, and the mapping is done here, once, in
+ * `toFill` and the three statements below. Renaming the columns is a migration of its own and is
+ * safe to do whenever there is a deploy window that tolerates it; nothing above this line has to
+ * change when it happens.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ */
 interface FillRow {
   readonly id: string
   readonly bot_id: string
@@ -92,8 +127,8 @@ export const toFill = (row: FillRow): FillRecord => ({
   mode: row.mode as FillMode,
   priceScaled: amountFrom(row.price_scaled),
   qty: amountFrom(row.qty),
-  shards: amountFrom(row.shards),
-  feeShards: amountFrom(row.fee_shards),
+  usdCents: amountFrom(row.shards),
+  feeUsdCents: amountFrom(row.fee_shards),
   reason: row.reason,
   status: row.status as FillStatus,
   entryId: row.entry_id,
@@ -110,8 +145,8 @@ export interface PlannedFill {
   readonly mode: FillMode
   readonly priceScaled: bigint
   readonly qty: bigint
-  readonly shards: bigint
-  readonly feeShards: bigint
+  readonly usdCents: bigint
+  readonly feeUsdCents: bigint
   readonly reason: string
 }
 
@@ -129,7 +164,7 @@ export async function bookFill(sql: Db | Tx, planned: PlannedFill): Promise<Fill
     values (
       ${planned.botId}, ${planned.userId}, ${planned.barT}, ${planned.side}, ${planned.mode},
       ${planned.priceScaled.toString()}, ${planned.qty.toString()},
-      ${planned.shards.toString()}, ${planned.feeShards.toString()},
+      ${planned.usdCents.toString()}, ${planned.feeUsdCents.toString()},
       ${planned.reason}, 'planned'
     )
     on conflict (bot_id, bar_t, side) do nothing
@@ -158,8 +193,8 @@ export interface FillOutcome {
   readonly priceScaled: bigint
   readonly qty: bigint
   /** Signed: negative on a buy, positive on a sell. */
-  readonly shards: bigint
-  readonly feeShards: bigint
+  readonly usdCents: bigint
+  readonly feeUsdCents: bigint
   readonly entryId: string | null
 }
 
@@ -218,8 +253,8 @@ export async function applyFill(
          set status       = 'settled',
              price_scaled = ${outcome.priceScaled.toString()},
              qty          = ${outcome.qty.toString()},
-             shards       = ${outcome.shards.toString()},
-             fee_shards   = ${outcome.feeShards.toString()},
+             shards       = ${outcome.usdCents.toString()},
+             fee_shards   = ${outcome.feeUsdCents.toString()},
              entry_id     = ${outcome.entryId},
              error        = null,
              settled_at   = now()
@@ -231,13 +266,13 @@ export async function applyFill(
     if (!row) return { status: 'already' } as ApplyResult
     const fill = toFill(row)
 
-    // The signed `shards` and the side together are the whole movement. A buy spends Shards and
-    // gains units; a sell is the mirror. Written as one statement so no intermediate state exists in
+    // The signed cent movement and the side together are the whole movement. A buy spends cash
+    // and gains units; a sell is the mirror. Written as one statement so no intermediate state exists in
     // which the position moved and the cash did not.
     const unitsDelta = fill.side === 'buy' ? fill.qty : -fill.qty
     await tx`
       update bots
-         set cash     = cash + ${fill.shards.toString()}::numeric,
+         set cash     = cash + ${fill.usdCents.toString()}::numeric,
              position = position + ${unitsDelta.toString()}::numeric
        where id = ${fill.botId}
     `
@@ -250,7 +285,7 @@ export async function applyFill(
         userId: fill.userId,
         side: fill.side,
         qty: fill.qty.toString(),
-        shards: fill.shards.toString(),
+        usdCents: fill.usdCents.toString(),
         entryId: fill.entryId,
       },
       // The OWNER off the fill row, never a caller: nothing reaches this function from a request,
@@ -302,7 +337,7 @@ export interface SettleFillDeps {
  * nothing. That is the property the concurrency test drives.
  */
 export async function settleFill(deps: SettleFillDeps, fill: FillRecord): Promise<ApplyResult | { status: 'refused' | 'unresolved'; reason: string }> {
-  const notional = fill.shards < 0n ? -fill.shards : fill.shards
+  const notional = fill.usdCents < 0n ? -fill.usdCents : fill.usdCents
   try {
     const entry = await deps.ledger.postEntry({
       kind: 'trading_fill',
@@ -314,9 +349,9 @@ export async function settleFill(deps: SettleFillDeps, fill: FillRecord): Promis
         userId: fill.userId,
         asset: deps.asset,
         side: fill.side,
-        notionalShards: notional,
+        notionalUsdCents: notional,
         units: fill.qty,
-        feeShards: fill.feeShards,
+        feeUsdCents: fill.feeUsdCents,
       }),
     })
     return await applyFill(
@@ -325,8 +360,8 @@ export async function settleFill(deps: SettleFillDeps, fill: FillRecord): Promis
       {
         priceScaled: fill.priceScaled,
         qty: fill.qty,
-        shards: fill.shards,
-        feeShards: fill.feeShards,
+        usdCents: fill.usdCents,
+        feeUsdCents: fill.feeUsdCents,
         entryId: entry.id,
       },
       deps.producer,

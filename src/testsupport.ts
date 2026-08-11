@@ -165,17 +165,17 @@ export function fakePricing(): FakePricing {
 export interface FakeLedger extends LedgerClient {
   readonly entries: readonly PostEntryRequest[]
   readonly keys: readonly string[]
-  /** Shards the subject can spend. Charges above it are refused with `insufficient_funds`. */
-  setBalance(userId: string, shards: bigint): void
+  /** US cents the subject can spend. Charges above it are refused with `insufficient_funds`. */
+  setBalance(userId: string, usdCents: bigint): void
   /**
    * The same thing for any subject and any asset, which is what the exchange's transfers need.
    *
    * A deposit debits `user:<id>` in the market's own asset and a withdrawal debits `exchange`, so
-   * neither is expressible as a shard balance. A subject/asset pair that has never been set is
+   * neither is expressible as a cent balance. A subject/asset pair that has never been set is
    * UNLIMITED, which is why adding this changes nothing for the tests that came before it.
    */
   setAssetBalance(subject: string, asset: string, amount: bigint): void
-  /** Hide the balance entirely, as an outage does. `availableShards` then answers null. */
+  /** Hide the balance entirely, as an outage does. `availableUsdCents` then answers null. */
   hideBalance(hidden: boolean): void
   /**
    * **Commit the next charge and lose the answer.**
@@ -239,8 +239,10 @@ export function fakeLedger(): FakeLedger {
   return {
     entries,
     keys,
-    setBalance(userId, shards) {
-      balances.set(slot(`user:${userId}`, 'SHARD'), shards)
+    // The SHARD slot, matching the real client: micro-ledger holds live capital in SHARD and the
+    // amount is a cent count at the 1:1 peg. See `src/ledgerclient.ts`.
+    setBalance(userId, usdCents) {
+      balances.set(slot(`user:${userId}`, 'SHARD'), usdCents)
     },
     setAssetBalance(subject, asset, amount) {
       balances.set(slot(subject, asset), amount)
@@ -353,7 +355,7 @@ export function fakeLedger(): FakeLedger {
       })
     },
 
-    async availableShards(userId) {
+    async availableUsdCents(userId) {
       if (hidden) return null
       return balances.get(slot(`user:${userId}`, 'SHARD')) ?? null
     },

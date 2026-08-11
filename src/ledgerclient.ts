@@ -10,9 +10,32 @@
  *     a claim about money.
  *   * For a **live** bot they are this service's record of what it asked for and what the ledger
  *     told it happened. They are moved only by applying a fill whose `entry_id` came back from the
- *     ledger, so every Shard of movement has a journal entry behind it. They are a **mirror with a
+ *     ledger, so every cent of movement has a journal entry behind it. They are a **mirror with a
  *     receipt**, not a balance — and when the two disagree, the ledger is right and this service is
  *     wrong.
+ *
+ * ## THIS FILE STILL SAYS `SHARD`, AND IT IS THE ONLY ONE THAT MAY
+ *
+ * micro-org#418 re-denominated micro-trade to US cents. Every amount above and every field this
+ * service puts on its OWN wire is a cent count. **The `assetCode` literals below are not renamed
+ * and must not be**, for a reason that outlives the retirement:
+ *
+ * An asset code here names an account in ANOTHER service's chart of accounts. Live capital sits in
+ * `user:<id> available SHARD` inside micro-ledger, where 69,000 real units are held for real
+ * people. Renaming the literal would not rename the account — it would address a different one, and
+ * a reservation or a fill posted against an account holding nothing either fails or moves the wrong
+ * money. That is a false statement about money, which is exactly the trade micro-mint refused from
+ * the other side of its own wire: `mint-web`'s `charge()` still prints SHARD for a debit
+ * micro-ledger really recorded in SHARD, and says so in as many words.
+ *
+ * The amounts are cents and the asset is SHARD, and both are true at once because the peg is
+ * exactly one to one — `SHARDS_PER_USD` is `100n`, SHARD carries `decimals: 0`. That is the shape
+ * mint landed on too: `price_usd_cents` for the amount, `charge_asset_code` for the asset.
+ *
+ * micro-ledger expects this. Its `retired_asset_guard` migration refuses retired assets only for
+ * ACQUISITION kinds, and deliberately leaves `trading_fill` and `performance_fee` legal — naming
+ * micro-trade among the services that must migrate before it can tighten. Moving those balances is
+ * a cross-service money migration over live accounts. It is not a rename, and it is not this change.
  *
  * ## The three things trade asks the ledger for
  *
@@ -182,13 +205,16 @@ export interface LedgerClient {
   reserve(request: ReserveRequest): Promise<Reservation>
   release(reservationId: string, request: Omit<ReserveRequest, 'subject' | 'assetCode' | 'amount'>): Promise<PostedEntry>
   /**
-   * Spendable Shards, right now, for one settlement decision.
+   * Spendable US cents, right now, for one settlement decision.
+   *
+   * Reads the SHARD wallet and returns a cent count. Both halves of that sentence are true — see
+   * the header: the peg is 1:1, and the asset code is micro-ledger's rather than this service's.
    *
    * **Read and discarded.** The answer is never written down: a stored balance is the thing 04 §11
    * forbids, and it would be stale the moment it landed. `null` means the ledger would not say —
    * which a caller must treat as "do not know", never as zero, because zero is a decision.
    */
-  availableShards(userId: string): Promise<bigint | null>
+  availableUsdCents(userId: string): Promise<bigint | null>
 }
 
 /* ------------------------------------------------------------------ the postings
@@ -223,10 +249,10 @@ export function fillPostings(input: {
   readonly asset: AssetCode
   readonly side: 'buy' | 'sell'
   /** Shards moved, always positive — the direction is carried by `side`. */
-  readonly notionalShards: bigint
+  readonly notionalUsdCents: bigint
   /** Base-asset smallest units moved, always positive. */
   readonly units: bigint
-  readonly feeShards: bigint
+  readonly feeUsdCents: bigint
 }): readonly PostingRequest[] {
   const subject = userSubject(input.userId)
   const shardWallet: AccountRef = { subject, assetCode: 'SHARD', purpose: 'available', type: 'liability' }
@@ -238,22 +264,22 @@ export function fillPostings(input: {
   const postings: PostingRequest[] =
     input.side === 'buy'
       ? [
-          { account: shardWallet, direction: 'debit', amount: input.notionalShards, assetCode: 'SHARD', sequence: 0 },
-          { account: shardClearing, direction: 'credit', amount: input.notionalShards, assetCode: 'SHARD', sequence: 1 },
+          { account: shardWallet, direction: 'debit', amount: input.notionalUsdCents, assetCode: 'SHARD', sequence: 0 },
+          { account: shardClearing, direction: 'credit', amount: input.notionalUsdCents, assetCode: 'SHARD', sequence: 1 },
           { account: assetClearing, direction: 'debit', amount: input.units, assetCode: input.asset, sequence: 2 },
           { account: assetWallet, direction: 'credit', amount: input.units, assetCode: input.asset, sequence: 3 },
         ]
       : [
           { account: assetWallet, direction: 'debit', amount: input.units, assetCode: input.asset, sequence: 0 },
           { account: assetClearing, direction: 'credit', amount: input.units, assetCode: input.asset, sequence: 1 },
-          { account: shardClearing, direction: 'debit', amount: input.notionalShards, assetCode: 'SHARD', sequence: 2 },
-          { account: shardWallet, direction: 'credit', amount: input.notionalShards, assetCode: 'SHARD', sequence: 3 },
+          { account: shardClearing, direction: 'debit', amount: input.notionalUsdCents, assetCode: 'SHARD', sequence: 2 },
+          { account: shardWallet, direction: 'credit', amount: input.notionalUsdCents, assetCode: 'SHARD', sequence: 3 },
         ]
 
-  if (input.feeShards > 0n) {
+  if (input.feeUsdCents > 0n) {
     postings.push(
-      { account: shardWallet, direction: 'debit', amount: input.feeShards, assetCode: 'SHARD', sequence: 4 },
-      { account: platformFees, direction: 'credit', amount: input.feeShards, assetCode: 'SHARD', sequence: 5 },
+      { account: shardWallet, direction: 'debit', amount: input.feeUsdCents, assetCode: 'SHARD', sequence: 4 },
+      { account: platformFees, direction: 'credit', amount: input.feeUsdCents, assetCode: 'SHARD', sequence: 5 },
     )
   }
   return postings
@@ -269,20 +295,20 @@ export function fillPostings(input: {
  */
 export function performanceFeePostings(input: {
   readonly userId: string
-  readonly amountShards: bigint
+  readonly amountUsdCents: bigint
 }): readonly PostingRequest[] {
   return [
     {
       account: { subject: userSubject(input.userId), assetCode: 'SHARD', purpose: 'available', type: 'liability' },
       direction: 'debit',
-      amount: input.amountShards,
+      amount: input.amountUsdCents,
       assetCode: 'SHARD',
       sequence: 0,
     },
     {
       account: { subject: 'platform', assetCode: 'SHARD', purpose: 'fees', type: 'revenue' },
       direction: 'credit',
-      amount: input.amountShards,
+      amount: input.amountUsdCents,
       assetCode: 'SHARD',
       sequence: 1,
     },
@@ -418,7 +444,7 @@ export function httpLedgerClient(options: LedgerClientOptions): LedgerClient {
       return { id: body.entry.id, kind: body.entry.kind, recordedAt: body.entry.recordedAt, replayed: body.replayed }
     },
 
-    async availableShards(userId) {
+    async availableUsdCents(userId) {
       try {
         const subject = encodeURIComponent(`user:${userId}`)
         const body = await client.get<{ balances: readonly RawBalance[] }>(`/accounts/${subject}/balances`)

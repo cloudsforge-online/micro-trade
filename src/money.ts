@@ -3,7 +3,7 @@
  *
  * ## Why this file exists at all
  *
- * The service this supersedes declares every Shard column as `bigint` in its schema and then reads
+ * The service this supersedes declares every money column as `bigint` in its schema and then reads
  * every one of them into a JavaScript **number** (`crucible/services/crucible/src/db/schema.ts`
  * and following: `bigint('cash', { mode: 'number' })`). It then does its position sizing in floats
  * — `qty = notional / price` at `crucible/services/crucible/src/engine/backtest.ts` — and
@@ -11,12 +11,23 @@
  * (`crucible/packages/contracts/src/index.ts). Every balance in that service is a float
  * wearing an integer's name.
  *
- * 04 §0: "Every fiat or Shard amount is a scaled integer. **No floats anywhere in money.**"
+ * 04 §0: "Every fiat amount is a scaled integer. **No floats anywhere in money.**"
+ *
+ * ## THE UNIT IS US CENTS, AND USED TO BE CALLED SOMETHING ELSE
+ *
+ * Every amount in this service was called a "Shard" until micro-org#418. It was never a different
+ * quantity: `SHARDS_PER_USD` is `100n`, fixed by contract, and SHARD carries `decimals: 0` — so one
+ * Shard was exactly one US cent, and the integers below are unchanged to the digit. SHARD is
+ * retired (`RETIRED_ASSETS`, `contracts/packages/chain/src/index.ts`), nothing new may be
+ * denominated in it, and this file now calls the unit what it is.
+ *
+ * **Nothing here was re-based, re-scaled or rounded.** Renaming was the whole change. If you are
+ * reading this because a figure looks wrong, the rename is not where it went wrong — `unit.test.ts`
+ * asserts the peg and the identity directly.
  *
  * ## The three units, and the one rule
  *
- *   * **Shards** — `bigint`, no sub-unit. 100 Shards = 1 USD, fixed (`SHARDS_PER_USD`). A fee of
- *     half a Shard is zero.
+ *   * **US cents** — `bigint`, no sub-unit. 100 cents = 1 USD. A fee of half a cent is zero.
  *   * **Base units** — `bigint`, the asset's smallest unit. BTC has 8 decimals, ETH 18; the number
  *     comes from `chainSpec(asset).decimals` and is never assumed.
  *   * **Price** — `bigint`, USD per WHOLE unit scaled by `RATE_SCALE` (10^6). Never a float, for
@@ -45,7 +56,20 @@ import {
   type AssetCode,
 } from '@cloudsforge/contracts-chain'
 
-export { RATE_SCALE, SHARDS_PER_USD }
+export { RATE_SCALE }
+
+/**
+ * Cents per US dollar: `100n`.
+ *
+ * The value is `contracts-chain`'s `SHARDS_PER_USD`, imported rather than re-declared, because a
+ * second literal `100n` in this repository is a second declaration of the peg free to drift from
+ * the first in silence. It is aliased rather than renamed at the source for the reason given on the
+ * two helpers below: `contracts-chain` is a different repository, on its own retirement schedule,
+ * and micro-pricing still derives a Shard column from that export.
+ *
+ * The peg is what makes this whole re-denomination the identity: 100 Shards = 1 USD = 100 cents.
+ */
+export const CENTS_PER_USD = SHARDS_PER_USD
 
 /** Basis points. 10_000 bps = 100%. An integer, always. */
 export const BPS_SCALE = 10_000n
@@ -107,37 +131,74 @@ export function slippedPrice(priceScaled: bigint, slippageBps: number, side: 'bu
   return side === 'buy' ? priceScaled + delta : priceScaled - delta
 }
 
-/** Shards a holding is worth at a price. Rounds DOWN — a valuation never flatters the holder. */
-export function valueInShards(units: bigint, asset: AssetCode, priceScaled: bigint): bigint {
+/**
+ * US cents a holding is worth at a price. Rounds DOWN — a valuation never flatters the holder.
+ *
+ * ## WHY THIS STILL CALLS A DEPRECATED HELPER, AND MUST
+ *
+ * `shardsForCoinAmount` is marked `@deprecated` in `contracts-chain`. It is still the right call
+ * here, and swapping it is not a tidy-up:
+ *
+ *   * It is **pure arithmetic at the peg** — `units × rate × 100 / (10^decimals × RATE_SCALE)`.
+ *     Because `SHARDS_PER_USD` is `100n` and cents are two decimals, that expression IS "cents at
+ *     this rate". The function's name is retired; its result is not wrong by a digit.
+ *   * `contracts-chain` offers **no replacement in this direction**. `coinAmountForUsdCents` is the
+ *     inverse — cents to coin — and there is no `usdCentsForCoinAmount` to move to. Hand-rolling
+ *     the expression here would put a second copy of the peg arithmetic in the estate, which is
+ *     what importing it exists to prevent.
+ *
+ * So it is imported under its retired name and returned as cents. When `contracts-chain` grows the
+ * USD-cents twin, this body becomes a one-line swap with no change to any caller or any figure.
+ */
+export function valueInCents(units: bigint, asset: AssetCode, priceScaled: bigint): bigint {
   requirePositive('units', units)
   requirePositive('priceScaled', priceScaled)
   if (priceScaled === 0n) throw new RangeError('a holding cannot be valued at a zero price')
   return shardsForCoinAmount(units, chainSpec(asset).decimals, priceScaled)
 }
 
-/** Base units a Shard amount buys at a price. Rounds DOWN — never hand out more than was paid for. */
-export function unitsForShards(shards: bigint, asset: AssetCode, priceScaled: bigint): bigint {
-  requirePositive('shards', shards)
+/**
+ * Base units a cent amount buys at a price. Rounds DOWN — never hand out more than was paid for.
+ *
+ * ## `coinAmountForUsdCents` IS NOT A DROP-IN HERE. DO NOT SWAP IT.
+ *
+ * `contracts-chain` deprecates `coinAmountForShards` and points at `coinAmountForUsdCents`, and at
+ * the peg the two compute the same integer. They do **not** behave the same at zero, and that is
+ * the whole difficulty:
+ *
+ *   * `coinAmountForUsdCents` **throws** when the result rounds down to zero. It is written for
+ *     *pricing a product*, where a zero is a free purchase, and its comment says so: "callers must
+ *     not paper over this".
+ *   * Here a zero is **routine and correct**. `planRebalance` (`bots.ts`) asks what a bot's
+ *     remaining cash buys, and `backtest.ts` asks the same on every bar. A few cents against an
+ *     8-decimal coin buys nothing, the caller checks `qty <= 0n` and records `no_signal`, and the
+ *     bot ticks on. Swapping the helper would turn the commonest tick a nearly-empty bot makes into
+ *     a thrown exception on a live path — an outage, produced by a rename.
+ *
+ * The zero is therefore load-bearing, and this keeps the helper whose contract returns it.
+ */
+export function unitsForCents(cents: bigint, asset: AssetCode, priceScaled: bigint): bigint {
+  requirePositive('cents', cents)
   if (priceScaled <= 0n) throw new RangeError('a purchase cannot settle at a zero price')
-  return coinAmountForShards(shards, chainSpec(asset).decimals, priceScaled)
+  return coinAmountForShards(cents, chainSpec(asset).decimals, priceScaled)
 }
 
 /**
- * A bot's equity: uninvested Shards plus what its position is worth.
+ * A bot's equity: uninvested cents plus what its position is worth.
  *
  * The one number the performance fee is assessed against, so it is computed in exactly one place.
  */
 export function equityOf(cash: bigint, units: bigint, asset: AssetCode, priceScaled: bigint): bigint {
-  return cash + valueInShards(units, asset, priceScaled)
+  return cash + valueInCents(units, asset, priceScaled)
 }
 
 /**
- * The performance fee owed on a bot's equity, in whole Shards.
+ * The performance fee owed on a bot's equity, in whole US cents.
  *
  * Ported from `crucible/packages/contracts/src/index.ts`, in bigint, with the behaviour
  * unchanged: it rounds DOWN, it returns zero when equity has not exceeded the high-water mark, and
  * it returns zero when the fee would fall under the floor. The floor exists because the accounting
- * costs more than the fee below it, and a settlement history full of one-Shard rows buries the ones
+ * costs more than the fee below it, and a settlement history full of one-cent rows buries the ones
  * that matter.
  *
  * The high-water rule is what makes the fee defensible, and it is worth restating because every
@@ -148,7 +209,7 @@ export function equityOf(cash: bigint, units: bigint, asset: AssetCode, priceSca
  *   - A bot that then loses 800 and wins it back is billed nothing for the recovery.
  *   - A bot that ends where it started has paid nothing, whatever it did in between.
  */
-export const MIN_FEE_SHARDS = 5n
+export const MIN_FEE_CENTS = 5n
 
 export function performanceFee(equity: bigint, highWaterMark: bigint, feeBps: number): bigint {
   requirePositive('equity', equity)
@@ -156,7 +217,7 @@ export function performanceFee(equity: bigint, highWaterMark: bigint, feeBps: nu
   const gain = equity - highWaterMark
   if (gain <= 0n) return 0n
   const fee = applyBps(gain, feeBps)
-  return fee < MIN_FEE_SHARDS ? 0n : fee
+  return fee < MIN_FEE_CENTS ? 0n : fee
 }
 
 /**

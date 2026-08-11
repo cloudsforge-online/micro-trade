@@ -86,8 +86,8 @@ function planned(overrides: Partial<PlannedFill> = {}): PlannedFill {
     mode: 'live',
     priceScaled: 30_000_000_000n,
     qty: 100_000n,
-    shards: -30_000n,
-    feeShards: 30n,
+    usdCents: -30_000n,
+    feeUsdCents: 30n,
     reason: 'a signal',
     ...overrides,
   }
@@ -115,7 +115,7 @@ test('a bot cannot book the same side of the same bar twice', { skip }, async ()
 
 test('the other side of the same bar is a different fill and is allowed', { skip }, async () => {
   assert.ok(await bookFill(db, planned({ side: 'buy' })))
-  assert.ok(await bookFill(db, planned({ side: 'sell', shards: 30_000n })))
+  assert.ok(await bookFill(db, planned({ side: 'sell', usdCents: 30_000n })))
 })
 
 test('a duplicate booking is a replay rather than a failure, so a benign race logs nothing red', { skip }, async () => {
@@ -201,7 +201,7 @@ test('ten concurrent settlements of one fill apply it exactly once', { skip }, a
 test('a sell moves the position the other way, by the amount on the row', { skip }, async () => {
   await sql`update bots set position = 500000 where id = ${botId}`
   const before = await botState()
-  const fill = await bookFill(db, planned({ side: 'sell', qty: 200_000n, shards: 60_000n }))
+  const fill = await bookFill(db, planned({ side: 'sell', qty: 200_000n, usdCents: 60_000n }))
   assert.ok(fill)
   await settleFill(deps(), fill)
   const after = await botState()
@@ -222,7 +222,7 @@ test('a refusal zeroes the fill, because the ledger looked and said nothing move
   const stored = await getFill(db, fill.id)
   assert.equal(stored?.status, 'refused')
   assert.equal(stored?.qty, 0n)
-  assert.equal(stored?.shards, 0n)
+  assert.equal(stored?.usdCents, 0n)
   assert.deepEqual(await botState(), before)
 })
 
@@ -285,8 +285,8 @@ test('a paper fill settles with no ledger entry, because a simulation must not r
     {
       priceScaled: fill.priceScaled,
       qty: fill.qty,
-      shards: fill.shards,
-      feeShards: fill.feeShards,
+      usdCents: fill.usdCents,
+      feeUsdCents: fill.feeUsdCents,
       entryId: null,
     },
     SERVICE,

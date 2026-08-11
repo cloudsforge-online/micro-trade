@@ -378,7 +378,7 @@ test('a partial fee collection says so on the wire, and a full one says somethin
   const short = await aBot(1_100_000n)
 
   await withOutbox(db, SERVICE, async (_tx, emit) => settle(deps(), full, 'assess', emit))
-  // The only difference between the two settlements. 15,000 Shards are due on each.
+  // The only difference between the two settlements. 15,000 cents are due on each.
   ledger.setBalance(ALICE, 6_000n)
   await withOutbox(db, SERVICE, async (_tx, emit) => settle(deps(), short, 'assess', emit))
 

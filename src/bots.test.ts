@@ -33,7 +33,7 @@ import {
 } from './bots.ts'
 import { getSeries } from './series.ts'
 import { registerHandlers, TICK_KIND, TICK_SWEEP_KIND } from './jobs.ts'
-import { RATE_SCALE, valueInShards } from './money.ts'
+import { RATE_SCALE, valueInCents } from './money.ts'
 import {
   ALICE,
   enabled,
@@ -153,8 +153,8 @@ test('a rebalance below the minimum is not worth its cost and is not planned', (
   // Without a threshold a fractional rule re-trades that step every bar and pays a fee for it, which
   // quietly turns a profitable rule into a losing one.
   const price = 30_000n * RATE_SCALE
-  const units = 16_666_666n // worth ~499,999 Shards at the price above
-  const held = valueInShards(units, 'BTC', price)
+  const units = 16_666_666n // worth ~499,999 cents at the price above
+  const held = valueInCents(units, 'BTC', price)
   assert.equal(planRebalance(5_000, held, units, 'BTC', price), null)
   // A real move is planned.
   assert.equal(planRebalance(10_000, held, units, 'BTC', price)?.side, 'buy')
@@ -169,7 +169,7 @@ test('a target of zero plans a sale of the whole position, not of nothing', () =
 
 test('a plan never spends more cash than the bot holds', () => {
   const plan = planRebalance(10_000, 500n, 0n, 'BTC', 30_000n * RATE_SCALE)
-  assert.ok(plan === null || plan.shards <= 500n)
+  assert.ok(plan === null || plan.usdCents <= 500n)
 })
 
 test('a plan never sells more units than the bot holds', () => {
@@ -185,7 +185,7 @@ test('nothing is planned at a zero price or against zero equity', () => {
 test('a target above 100% is clamped rather than levering the account', () => {
   const plan = planRebalance(50_000, 1_000_000n, 0n, 'BTC', 30_000n * RATE_SCALE)
   assert.ok(plan)
-  assert.ok(plan.shards <= 1_000_000n, 'a bot cannot spend more than it has')
+  assert.ok(plan.usdCents <= 1_000_000n, 'a bot cannot spend more than it has')
 })
 
 /* ------------------------------------------------------------------ the tick */

@@ -78,6 +78,66 @@ interface BacktestRow {
 const COLUMNS = `id, user_id, status, series_id, strategy_id, params, seed, start_cash, fee_bps,
   slippage_bps, from_t, to_t, result_digest, metrics, notes, error`
 
+/**
+ * micro-org#418: the money keys a STORED result was written with, and what they are called now.
+ *
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * THIS IS NOT A COMPATIBILITY SHIM FOR CLIENTS. IT IS A READER FOR OLD ROWS, AND IT IS REQUIRED.
+ *
+ * `metrics`, `trades` and `equity` are `jsonb`. `serialiseResult` writes them from the TypeScript
+ * field names, so every backtest completed before this change has `feesPaidShards` inside its JSON
+ * and every one completed after has `feesPaidUsdCents`. The column is opaque to the type system —
+ * `metrics: unknown` below, `readonly unknown[]` on the result rows — so renaming the interfaces in
+ * `src/performance.ts` did not and could not make the stored documents follow.
+ *
+ * Without this, the compiler stays green, every test that runs a fresh backtest stays green, and
+ * EVERY BACKTEST A CUSTOMER ALREADY HAS renders a blank where its fees, its best trade and its
+ * worst trade used to be — because `undefined` is not `'0'`, so a client's "absent" branch does not
+ * fire either. That is exactly how micro-worlds' `rewardShards`→`rewardWei` rename put 47 blank
+ * amounts on mainnet for a year: nothing was red, because nothing tested the old shape.
+ *
+ * A jsonb data migration would fix it once and for all, and is the right thing eventually. It is
+ * not done here: it would have to rewrite an array of fills per row, in a migration, on the same
+ * deploy that renames everything else, and this mapping is exact, cheap and reversible. When that
+ * migration lands, delete this map and this test will tell you it is safe to.
+ *
+ * The values are UNTOUCHED. One Shard was exactly one cent (`src/money.ts`), so a stored figure is
+ * already correct under its new name; only the key moves.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ */
+const RENAMED_MONEY_KEYS: Readonly<Record<string, string>> = {
+  feesPaidShards: 'feesPaidUsdCents',
+  bestTradeShards: 'bestTradeUsdCents',
+  worstTradeShards: 'worstTradeUsdCents',
+  notionalShards: 'notionalUsdCents',
+  feeShards: 'feeUsdCents',
+  pnlShards: 'pnlUsdCents',
+}
+
+/**
+ * Rename the money keys of one stored JSON object, one level deep, leaving every value alone.
+ *
+ * A non-object — including `null`, which `metrics` is until a run completes — comes back as it went
+ * in. An object that already carries the new name is left alone rather than overwritten, so a row
+ * written after this change is never rewritten by a stale key that happens to sit beside it.
+ */
+export function renameStoredMoneyKeys(value: unknown): unknown {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return value
+  const source = value as Record<string, unknown>
+  let touched = false
+  const out: Record<string, unknown> = {}
+  for (const [key, held] of Object.entries(source)) {
+    const renamed = RENAMED_MONEY_KEYS[key]
+    if (renamed !== undefined && !(renamed in source)) {
+      out[renamed] = held
+      touched = true
+    } else {
+      out[key] = held
+    }
+  }
+  return touched ? out : value
+}
+
 function toBacktest(row: BacktestRow): BacktestRecord {
   if (!isStrategyId(row.strategy_id)) {
     throw new Error(`backtest ${row.id} names an unknown strategy ${row.strategy_id}`)
@@ -96,7 +156,7 @@ function toBacktest(row: BacktestRow): BacktestRecord {
     fromT: row.from_t === null ? null : Number(row.from_t),
     toT: row.to_t === null ? null : Number(row.to_t),
     resultDigest: row.result_digest,
-    metrics: row.metrics,
+    metrics: renameStoredMoneyKeys(row.metrics),
     notes: row.notes ?? [],
     error: row.error,
   }
@@ -181,7 +241,7 @@ export async function getOwnedBacktestResult(
   if (!row) return null
   return {
     status: row.status as BacktestStatus,
-    fills: Array.isArray(row.trades) ? (row.trades as readonly unknown[]) : null,
+    fills: Array.isArray(row.trades) ? row.trades.map(renameStoredMoneyKeys) : null,
     equity: Array.isArray(row.equity) ? (row.equity as readonly unknown[]) : null,
   }
 }

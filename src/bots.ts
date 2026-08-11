@@ -38,8 +38,8 @@ import {
   amountFrom,
   equityOf,
   slippedPrice,
-  unitsForShards,
-  valueInShards,
+  unitsForCents,
+  valueInCents,
 } from './money.ts'
 import { compileSignals } from './strategies.ts'
 import { isStrategyId, type StrategyId, type StrategyParams, type Timeframe } from './catalog.ts'
@@ -305,8 +305,8 @@ export async function updateBot(sql: Db | Tx, id: string, patch: BotPatch): Prom
 
 export interface Rebalance {
   readonly side: FillSide
-  /** Shards to spend, on a buy. */
-  readonly shards: bigint
+  /** US cents to spend, on a buy. */
+  readonly usdCents: bigint
   /** Base-asset units to sell, on a sell. */
   readonly units: bigint
 }
@@ -326,7 +326,7 @@ export function planRebalance(
   markScaled: bigint,
 ): Rebalance | null {
   if (markScaled <= 0n) return null
-  const held = valueInShards(units, asset, markScaled)
+  const held = valueInCents(units, asset, markScaled)
   const equity = cash + held
   if (equity <= 0n) return null
 
@@ -336,13 +336,13 @@ export function planRebalance(
   if (magnitude * BPS_SCALE < MIN_REBALANCE_BPS * equity) return null
 
   if (delta > 0n) {
-    const shards = delta < cash ? delta : cash
-    // Below one Shard there is nothing to trade: Shards have no sub-unit.
-    return shards >= 1n ? { side: 'buy', shards, units: 0n } : null
+    const usdCents = delta < cash ? delta : cash
+    // Below one cent there is nothing to trade: cents have no sub-unit.
+    return usdCents >= 1n ? { side: 'buy', usdCents, units: 0n } : null
   }
-  const wanted = unitsForShards(-delta, asset, markScaled)
+  const wanted = unitsForCents(-delta, asset, markScaled)
   const sell = wanted < units ? wanted : units
-  return sell > 0n ? { side: 'sell', shards: 0n, units: sell } : null
+  return sell > 0n ? { side: 'sell', usdCents: 0n, units: sell } : null
 }
 
 export interface TickDeps {
@@ -470,9 +470,9 @@ export async function tickBot(
       // `bots_amounts_non_negative` constraint.
       const feeBps = bot.mode === 'paper' ? PAPER_FEE_BPS : 0
       const affordable = (bot.cash * BPS_SCALE) / (BPS_SCALE + BigInt(feeBps))
-      const spend = action.shards < affordable ? action.shards : affordable
-      const notional = action.side === 'buy' ? spend : valueInShards(action.units, asset, fillPrice)
-      const qty = action.side === 'buy' ? unitsForShards(notional, asset, fillPrice) : action.units
+      const spend = action.usdCents < affordable ? action.usdCents : affordable
+      const notional = action.side === 'buy' ? spend : valueInCents(action.units, asset, fillPrice)
+      const qty = action.side === 'buy' ? unitsForCents(notional, asset, fillPrice) : action.units
       const fee = applyBps(notional, feeBps)
 
       const planned: PlannedFill = {
@@ -484,8 +484,8 @@ export async function tickBot(
         priceScaled: fillPrice,
         qty,
         // Signed. A buy costs the notional and the fee; a sell returns the notional less the fee.
-        shards: action.side === 'buy' ? -(notional + fee) : notional - fee,
-        feeShards: fee,
+        usdCents: action.side === 'buy' ? -(notional + fee) : notional - fee,
+        feeUsdCents: fee,
         reason: `${bot.strategyId}: ${signal.reason}`,
       }
 
@@ -511,8 +511,8 @@ export async function tickBot(
             {
               priceScaled: planned.priceScaled,
               qty: planned.qty,
-              shards: planned.shards,
-              feeShards: planned.feeShards,
+              usdCents: planned.usdCents,
+              feeUsdCents: planned.feeUsdCents,
               entryId: null,
             },
             deps.producer,
@@ -588,6 +588,21 @@ export async function startBot(
       // The contract's constructor, not a template literal: it is the same grammar micro-org#372
       // was about, and it refuses an id that would collide two accounts onto one key.
       subject: userSubject(bot.userId),
+      // THE ASSET CODE IS micro-ledger'S, AND micro-org#418 DELIBERATELY DID NOT TOUCH IT.
+      //
+      // This service now denominates itself in US cents, and `bot.allocation` is a cent count. The
+      // integer sent here is unchanged, because the peg is exactly one Shard to one cent — but the
+      // asset an account is held in is a fact about micro-ledger's chart of accounts, not a label
+      // this service is free to restate. A user's live capital sits in `user:<id> available SHARD`
+      // over there; naming anything else here would either be refused or would reserve against an
+      // account holding nothing, and either way the reservation would stop protecting the capital
+      // it exists to protect.
+      //
+      // micro-ledger's `retired_asset_guard` migration knows about this and permits it on purpose:
+      // it refuses retired assets only for ACQUISITION kinds, and lists `trading_fill` and
+      // `performance_fee` among the kinds that "live services still post in SHARD today", naming
+      // micro-trade as one that must migrate before the trigger can be tightened. That migration is
+      // a money movement over real balances across two services, and it is not this change.
       assetCode: 'SHARD',
       amount: bot.allocation,
       actor: 'service:trade',

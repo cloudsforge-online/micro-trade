@@ -143,8 +143,8 @@ test('cash never goes negative, however aggressive the rule or the fee', () => {
 
 test('the fees reported are exactly the sum of the fees charged, with no rounding leak', () => {
   const result = run(input({ feeBps: 137 }))
-  const summed = result.fills.reduce((total, fill) => total + fill.feeShards, 0n)
-  assert.equal(result.metrics.feesPaidShards, summed)
+  const summed = result.fills.reduce((total, fill) => total + fill.feeUsdCents, 0n)
+  assert.equal(result.metrics.feesPaidUsdCents, summed)
 })
 
 test('every amount in a result is a bigint, so nothing became a float on the way out', () => {
@@ -152,10 +152,10 @@ test('every amount in a result is a bigint, so nothing became a float on the way
   for (const fill of result.fills) {
     assert.equal(typeof fill.priceScaled, 'bigint')
     assert.equal(typeof fill.qty, 'bigint')
-    assert.equal(typeof fill.notionalShards, 'bigint')
-    assert.equal(typeof fill.feeShards, 'bigint')
+    assert.equal(typeof fill.notionalUsdCents, 'bigint')
+    assert.equal(typeof fill.feeUsdCents, 'bigint')
   }
-  for (const key of ['startEquity', 'endEquity', 'feesPaidShards', 'bestTradeShards', 'worstTradeShards'] as const) {
+  for (const key of ['startEquity', 'endEquity', 'feesPaidUsdCents', 'bestTradeUsdCents', 'worstTradeUsdCents'] as const) {
     assert.equal(typeof result.metrics[key], 'bigint', `${key} is not a bigint`)
   }
   for (const key of ['totalReturnBps', 'holdReturnBps', 'maxDrawdownBps', 'exposureBps', 'winRateBps'] as const) {
@@ -237,7 +237,7 @@ test('a price of one scaled unit does not divide by zero or produce an infinite 
   assert.ok(Number.isFinite(result.metrics.sharpe))
 })
 
-test('a start cash of one Shard is handled without a division by zero', () => {
+test('a start cash of one cent is handled without a division by zero', () => {
   const result = run(input({ startCash: 1n }))
   assert.equal(result.metrics.startEquity, 1n)
   assert.ok(result.metrics.endEquity >= 0n)

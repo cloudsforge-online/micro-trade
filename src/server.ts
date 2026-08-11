@@ -729,8 +729,8 @@ function buildRoutes(): Route[] {
             priceScaled: amountTo(fill.priceScaled),
             price: formatPrice(fill.priceScaled),
             qty: amountTo(fill.qty),
-            shards: amountTo(fill.shards),
-            feeShards: amountTo(fill.feeShards),
+            usdCents: amountTo(fill.usdCents),
+            feeUsdCents: amountTo(fill.feeUsdCents),
           })),
         },
       }
@@ -1686,7 +1686,7 @@ function backtestView(backtest: BacktestRecord): Record<string, unknown> {
   return { ...backtest, startCash: amountTo(backtest.startCash) }
 }
 
-/** Amounts leave as decimal strings. A Shard balance fits in a double; a position in wei does not. */
+/** Amounts leave as decimal strings. A cent balance fits in a double; a position in wei does not. */
 function botView(bot: BotRecord): Record<string, unknown> {
   return {
     ...bot,
@@ -1740,7 +1740,7 @@ function requireUuid(body: Record<string, unknown>, field: string): string {
 function requireAmount(body: Record<string, unknown>, field: string): bigint {
   const value = body[field]
   if (typeof value === 'string') {
-    if (!/^\d+$/.test(value)) throw new BadRequestError(`${field} must be a whole number of Shards, as a string`)
+    if (!/^\d+$/.test(value)) throw new BadRequestError(`${field} must be a whole number of US cents, as a string`)
     return BigInt(value)
   }
   if (typeof value === 'number') {
