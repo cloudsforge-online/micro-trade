@@ -94,7 +94,7 @@ async function aBot(equity = ALLOCATION): Promise<BotRecord> {
     { sql: db, ledger, producer: 'trade', correlationId: 'r', liveEnabled: true },
     created,
   )
-  if (equity !== ALLOCATION) await updateBot(db, started.id, { equity })
+  if (equity !== ALLOCATION) await updateBot(db, started.id, { equity, equityPriceSource: 'market' })
   return (await getBot(db, started.id)) as BotRecord
 }
 
@@ -156,11 +156,11 @@ test('a bot that loses and wins the same money back pays nothing for the recover
 
   // Down to 900,000, then back to exactly where it was billed.
   clock.advance(PERIOD_SECONDS * 1000)
-  await updateBot(db, bot.id, { equity: 900_000n })
+  await updateBot(db, bot.id, { equity: 900_000n, equityPriceSource: 'market' })
   await settle(deps(), (await getBot(db, bot.id)) as BotRecord)
 
   clock.advance(PERIOD_SECONDS * 1000)
-  await updateBot(db, bot.id, { equity: 1_100_000n })
+  await updateBot(db, bot.id, { equity: 1_100_000n, equityPriceSource: 'market' })
   const outcome = await settle(deps(), (await getBot(db, bot.id)) as BotRecord)
   assert.equal(outcome.settlement, null, 'the recovery was billed')
 
@@ -227,7 +227,7 @@ test('the mark never moves down, so the climb back is not billed a second time',
 
   // Now under water, but carrying arrears, which is what makes the total billable.
   clock.advance(PERIOD_SECONDS * 1000)
-  await updateBot(db, bot.id, { equity: 800_000n, feeOwed: 5_000n })
+  await updateBot(db, bot.id, { equity: 800_000n, equityPriceSource: 'market', feeOwed: 5_000n })
   await settle(deps(), (await getBot(db, bot.id)) as BotRecord)
 
   assert.equal((await getBot(db, bot.id))?.highWaterMark, 1_100_000n, 'the mark was dragged down')
@@ -285,7 +285,7 @@ test('nothing new is assessed while an earlier outcome is unknown', { skip }, as
   // A later period, with a further gain. It must be deferred, not billed.
   clock.advance(PERIOD_SECONDS * 1000)
   ledger.failNext(99) // the ledger stays unreachable, so the pending row stays undecided
-  await updateBot(db, bot.id, { equity: 2_000_000n })
+  await updateBot(db, bot.id, { equity: 2_000_000n, equityPriceSource: 'market' })
   const second = await settle(deps(), (await getBot(db, bot.id)) as BotRecord)
 
   assert.equal(second.settlement, null)
@@ -437,7 +437,7 @@ test('a refused row is retired so the pending set cannot block every later asses
   // Money arrives, a later period assesses again, and the earlier refusal does not stand in the way.
   clock.advance(PERIOD_SECONDS * 1000)
   ledger.setBalance(ALICE, 1_000_000n)
-  await updateBot(db, bot.id, { equity: 1_200_000n })
+  await updateBot(db, bot.id, { equity: 1_200_000n, equityPriceSource: 'market' })
   const outcome = await settle(deps(), (await getBot(db, bot.id)) as BotRecord)
   assert.equal(outcome.settlement?.status, 'charged')
 })
@@ -460,7 +460,7 @@ test('stopping releases the capital reservation and settles the realised gain', 
   assert.ok(bot.reservationEntryId)
 
   const outcome = await stopBot(
-    { ...deps(), producer: 'trade', markEquity: async () => 1_100_000n },
+    { ...deps(), producer: 'trade', markEquity: async () => ({ equity: 1_100_000n, priceSource: 'market' }) },
     bot,
   )
   const after = await getBot(db, bot.id)
@@ -484,7 +484,7 @@ test('stopping without a usable price reconciles arrears instead of billing an u
 test('a bot always stops, even when the settlement on the way out cannot complete', { skip }, async () => {
   const bot = await aBot(1_100_000n)
   ledger.failNext(99)
-  await stopBot({ ...deps(), producer: 'trade', markEquity: async () => 1_100_000n }, bot)
+  await stopBot({ ...deps(), producer: 'trade', markEquity: async () => ({ equity: 1_100_000n, priceSource: 'market' }) }, bot)
   assert.equal((await getBot(db, bot.id))?.status, 'stopped', 'a bot the operator stopped kept running')
 })
 

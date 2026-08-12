@@ -62,6 +62,7 @@ import {
   pauseBot,
   startBot,
   type BotRecord,
+  type Mark,
 } from './bots.ts'
 import { listFills } from './fills.ts'
 import { listSettlements, stopBot, type FeeDeps } from './fees.ts'
@@ -845,7 +846,7 @@ function buildRoutes(): Route[] {
               const feeDeps: FeeDeps & {
                 ledger: LedgerClient
                 producer: string
-                markEquity: (b: BotRecord) => Promise<bigint | null>
+                markEquity: (b: BotRecord) => Promise<Mark | null>
               } = {
                 sql: deps.sql,
                 ledger: deps.ledger,
@@ -1621,18 +1622,25 @@ function transferView(transfer: TransferRecord): Record<string, unknown> {
 /* ------------------------------------------------------------------ helpers */
 
 /**
- * The current mark for a bot's position, or null.
+ * The current mark for a bot's position, and what it was taken against — or null.
  *
  * Null rather than a throw, because the one caller — `stopBot` — has a defined narrower behaviour
  * for "no price" and turning it into an exception would abort a stop that must complete.
+ *
+ * The quote's own `source` is returned with the number rather than being re-derived from the asset
+ * later. This path always asks pricing, so `bar` cannot arise here — a stop re-marks a paper bot
+ * against the oracle too, which is the same price its final assessment is computed from.
  */
-async function markEquityAt(deps: ServerDeps, bot: BotRecord): Promise<bigint | null> {
+async function markEquityAt(deps: ServerDeps, bot: BotRecord): Promise<Mark | null> {
   const series = await getSeries(deps.sql, bot.seriesId)
   if (!series) return null
   try {
     const { equityOf } = await import('./money.ts')
     const quote = await deps.pricing.quote(series.assetCode as never)
-    return equityOf(bot.cash, bot.position, series.assetCode as never, quote.midScaled)
+    return {
+      equity: equityOf(bot.cash, bot.position, series.assetCode as never, quote.midScaled),
+      priceSource: quote.source,
+    }
   } catch (err) {
     if (err instanceof RateUnavailableError) return null
     throw err

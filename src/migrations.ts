@@ -722,6 +722,49 @@ export const MIGRATIONS: readonly Migration[] = [
       on conflict (symbol) do nothing;
     `,
   },
+  {
+    version: 11,
+    name: 'equity_price_source',
+    // ────────────────────────────────────────────────────────────────────────────────────────────
+    // WHERE THE MARK CAME FROM.
+    //
+    // `bots.equity` has been a mark-to-market number since version 6 and has never said what it was
+    // marked AGAINST. That is the defect micro-org#368 names: on this estate the only series that
+    // exists is EMBER-denominated, and pricing serves EMBER as `administered` — a price an operator
+    // typed, which by pricing's own design never goes stale and is not a median of anything. A user
+    // reading an equity curve cannot tell that apart from a coin with four independent sources
+    // behind it, and neither can anything downstream, because the fact was never recorded.
+    //
+    // A column rather than a note on the screen, because the provenance belongs to the WRITE. The
+    // tick that marks the position is the only moment the answer is known; recomputing it later
+    // from the asset's CURRENT source would report today's arrangement against an equity figure
+    // written weeks ago, and would be wrong in exactly the cases anyone would care about — an asset
+    // that moved from administered to market, or the other way.
+    //
+    // Nullable, and null is a statement: no mark has happened yet. `insertBot` seeds `equity` from
+    // `allocation`, so a draft bot's equity is the capital committed and not a valuation at all.
+    // There is no backfill for the same reason there is no default — mainnet and testnet both hold
+    // zero rows in this table (measured 2026-08-12 on both networks and recorded on micro-org#368),
+    // and inventing a provenance for a row that has one would be the same lie in a new column.
+    // ────────────────────────────────────────────────────────────────────────────────────────────
+    up: `
+      alter table bots add column if not exists equity_price_source text;
+
+      -- The vocabulary, enforced here so a hand-written update cannot invent a fifth word:
+      --   market       -- pricing quoted a median of independent sources
+      --   administered -- pricing quoted a number an operator set (EMBER today)
+      --   bar          -- a PAPER bot, marked at the series' own last closed bar; not a quote at all
+      --   unknown      -- pricing answered with a word this build does not recognise
+      -- 'bar' and 'unknown' are the two that make the column honest rather than merely present: a
+      -- paper bot never calls pricing, and a source string off the wire must not be filed under
+      -- 'market' because nothing matched.
+      alter table bots drop constraint if exists bots_equity_price_source_known;
+      alter table bots add constraint bots_equity_price_source_known check (
+        equity_price_source is null
+          or equity_price_source in ('market','administered','bar','unknown')
+      );
+    `,
+  },
 ]
 
 /**
