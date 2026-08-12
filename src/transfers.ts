@@ -256,13 +256,31 @@ export async function applyTransfer(
     if (transfer.direction === 'deposit') {
       await credit(tx, transfer.userId, transfer.asset, transfer.amount)
     }
+    // ── `assetCode`, NOT `asset` — micro-org#367 ─────────────────────────────────────────────────
+    //
+    // This field was spelled `asset` from the day the topic was registered, and it is the only
+    // asset-bearing payload on the estate that spells it that way. The cost is entirely in the
+    // consumer: `activity/src/classify.ts` fills its `asset_code` COLUMN from a payload key called
+    // `assetCode` and from nothing else, so every exchange transfer landed with `asset_code` null
+    // and could not be filtered or grouped by asset. That file's own comment argues the point at
+    // length and then declines to invent a second spelling for the column, which was the right
+    // call: the producer is the half that is wrong.
+    //
+    // Renamed rather than sent twice. A payload carrying both spellings is a payload that has to
+    // carry both for ever, and the second one is exactly the thing a reader would later copy.
+    //
+    // No migration and no backfill, and that is measured rather than assumed: mainnet
+    // `trade.exchange_transfers` held zero rows and `TRADE_EXCHANGE_ENABLED` is set on neither
+    // network (re-measured 2026-08-12, unchanged since the exchange-subject audit recorded it), so
+    // there is no history under the old spelling and no consumer row to correct. The window in
+    // which this rename is free is the one it is being made in.
     publish({
       topic: 'trade.transfer.settled',
       key: transfer.id,
       payload: {
         transferId: transfer.id,
         userId: transfer.userId,
-        asset: transfer.asset,
+        assetCode: transfer.asset,
         direction: transfer.direction,
         amount: transfer.amount.toString(),
         entryId,

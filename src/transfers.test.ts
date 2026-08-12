@@ -29,8 +29,8 @@ import {
 } from './transfers.ts'
 import { EXCHANGE, parseAccountSubject } from '@cloudsforge/contracts-money'
 import { InsufficientFundsError, getBalance } from './accounts.ts'
-import { withOutbox, type Db } from './outbox.ts'
-import { SERVICE } from './topics.ts'
+import { buildEnvelope, withOutbox, type Db } from './outbox.ts'
+import { SERVICE, envelopeDefects } from './topics.ts'
 import {
   ALICE,
   BOB,
@@ -44,6 +44,24 @@ import {
   skip,
   type FakeLedger,
 } from './testsupport.ts'
+
+/**
+ * The relay's own row shape, restated here because `outbox.ts` keeps it private — the same
+ * structural copy `bots.test.ts` carries, and for the same reason: the point of reading a REAL row
+ * back out of the table and building the envelope from it is that nothing in this file gets to
+ * invent what a producer sends. A fixture envelope proves a fixture.
+ */
+interface OutboxRow {
+  readonly id: string
+  readonly topic: string
+  readonly key: string
+  readonly occurred_at: Date
+  readonly producer: string
+  readonly version: number
+  readonly actor: string | null
+  readonly correlation_id: string | null
+  readonly payload: Record<string, unknown>
+}
 
 let sql: postgres.Sql
 let db: Db
@@ -224,6 +242,54 @@ describe('a deposit', { skip }, () => {
     assert.equal(new Set(ledger.keys).size, 1)
     assert.equal((await getBalance(db, ALICE, 'BTC')).available, 1_000n)
   })
+})
+
+/* ------------------------------------------------------------------ the event */
+
+/**
+ * The settled transfer names its asset the way the estate spells it — micro-org#367.
+ *
+ * ## The mutation this kills
+ *
+ * Spelling the payload key `asset`, which is what shipped and what every exchange transfer would
+ * have carried. Nothing in this repository could see the cost, because the cost is entirely one
+ * repository downstream: `activity/src/classify.ts` fills its `asset_code` COLUMN from a payload
+ * key called `assetCode` and from nothing else, so `asset_code` was null on every exchange
+ * transfer and the rows could not be filtered or grouped by the asset they moved. This service's
+ * own suite was green throughout — the row was right, the ledger was right, and the field name was
+ * the only thing wrong.
+ *
+ * So the assertion is on the OUTBOX ROW and it is a pair: the estate's spelling is present AND the
+ * old one is gone. Asserting only the first passes against a payload that carries both, which is
+ * the shape somebody reaches for when they do not want to break a consumer — and which would make
+ * the wrong spelling permanent, because the second key is the one the next reader copies.
+ *
+ * `envelopeDefects` is run over it for the same reason `bots.test.ts` runs it over a fill: whether
+ * the estate can read this event is the contract's answer, not this file's.
+ */
+test('a settled transfer names its asset assetCode, which is the only spelling activity reads', { skip }, async () => {
+  const transfer = await book('deposit', ALICE, 'BTC', 1_000n)
+  assert.equal((await settleTransfer(deps(), transfer)).status, 'settled')
+
+  const rows = await sql<OutboxRow[]>`
+    select id, topic, key, occurred_at, producer, version, actor, correlation_id, payload
+      from outbox where topic = 'trade.transfer.settled'
+  `
+  assert.equal(rows.length, 1, 'the transfer settled and the estate was told nothing')
+
+  const envelope = buildEnvelope(rows[0]!)
+  assert.equal(envelope.payload['assetCode'], 'BTC', 'activity fills asset_code from assetCode and from nothing else')
+  assert.equal(
+    Object.hasOwn(envelope.payload, 'asset'),
+    false,
+    'the old spelling is still on the wire, so the wrong key outlives the fix',
+  )
+  assert.equal(envelope.key, rows[0]!.payload['transferId'], 'the registry keys this topic by the transfer')
+  assert.deepEqual(
+    envelopeDefects(JSON.parse(JSON.stringify(envelope))),
+    [],
+    'a transfer event every consumer in the estate would refuse',
+  )
 })
 
 /* ------------------------------------------------------------------ withdrawals */
