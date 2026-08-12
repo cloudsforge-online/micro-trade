@@ -91,6 +91,27 @@ export class RateUnavailableError extends Error {
   }
 }
 
+/**
+ * What KIND of number a quote is.
+ *
+ * Pricing's own vocabulary, and its database enforces it: `source text not null check (source in
+ * ('market', 'administered'))` on `price_quotes` (`micro-pricing/src/migrations.ts`), where the
+ * comment reads "'market' means a median of independent sources; 'administered' means an operator
+ * typed it". The two are not interchangeable and the difference is not cosmetic — an administered
+ * price is a number a person chose, it never decays at pricing, and a position marked against one is
+ * worth what the operator says it is worth.
+ *
+ * `unknown` is here because this is a wire value. Pricing constrains its own column; this service
+ * reads a JSON string over HTTP, and a word neither branch recognises must not be quietly filed
+ * under `market` — that would report an administered mark as a market one, which is the exact defect
+ * micro-org#368 is about, arrived at by a different route.
+ */
+export type QuoteSource = 'market' | 'administered' | 'unknown'
+
+export function quoteSourceOf(raw: string): QuoteSource {
+  return raw === 'market' || raw === 'administered' ? raw : 'unknown'
+}
+
 export interface Quote {
   readonly assetCode: AssetCode
   /** Mid-market USD per whole coin, scaled by `RATE_SCALE`. For MARKING a position. */
@@ -101,7 +122,8 @@ export interface Quote {
   readonly sellScaled: bigint
   /** When the underlying market observation was made — not when this response was built. */
   readonly asOf: string
-  readonly source: string
+  /** Narrowed at this boundary, so no caller has to know what strings pricing emits. */
+  readonly source: QuoteSource
 }
 
 /** The subset of pricing's `RateView` this service actually reads. 14 §6: not the whole response. */
@@ -186,7 +208,14 @@ export function httpPricingClient(options: PricingClientOptions): PricingClient 
       const buy = parseScaled(asset, 'usdBuyScaled', rate.usdBuyScaled)
       const sell = parseScaled(asset, 'usdSellScaled', rate.usdSellScaled)
 
-      return { assetCode: asset, midScaled: mid, buyScaled: buy, sellScaled: sell, asOf: rate.quotedAt, source: rate.source }
+      return {
+        assetCode: asset,
+        midScaled: mid,
+        buyScaled: buy,
+        sellScaled: sell,
+        asOf: rate.quotedAt,
+        source: quoteSourceOf(rate.source),
+      }
     },
   }
 }

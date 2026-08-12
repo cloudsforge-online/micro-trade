@@ -74,7 +74,7 @@ import {
   settlementIdempotencyKey,
   type LedgerClient,
 } from './ledgerclient.ts'
-import { updateBot, type BotRecord } from './bots.ts'
+import { updateBot, type BotRecord, type Mark } from './bots.ts'
 import type { Clock } from './rng.ts'
 import type { Db, Emit } from './outbox.ts'
 
@@ -598,7 +598,9 @@ export async function stopBot(
   deps: FeeDeps & {
     readonly ledger: LedgerClient
     readonly producer: string
-    readonly markEquity: (bot: BotRecord) => Promise<bigint | null>
+    // The mark AND what it was taken against. The pair, because a stop is one of the three places
+    // `bots.equity` is written and micro-org#368 is about a write that dropped the second half.
+    readonly markEquity: (bot: BotRecord) => Promise<Mark | null>
   },
   bot: BotRecord,
 ): Promise<SettleOutcome> {
@@ -634,6 +636,6 @@ export async function stopBot(
     })
     return settle(deps, bot, 'arrears')
   }
-  await updateBot(deps.sql, bot.id, { equity: marked })
-  return settle(deps, { ...bot, equity: marked }, 'assess')
+  await updateBot(deps.sql, bot.id, { equity: marked.equity, equityPriceSource: marked.priceSource })
+  return settle(deps, { ...bot, equity: marked.equity, equityPriceSource: marked.priceSource }, 'assess')
 }

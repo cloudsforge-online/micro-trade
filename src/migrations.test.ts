@@ -167,6 +167,25 @@ test('a paper bot needs no reservation, because no real capital is committed', {
   )
 })
 
+test('a bot cannot claim a price source outside the four this service knows', { skip }, async () => {
+  // The vocabulary is enforced in the schema because a mark's provenance is read by screens and by
+  // people, and a word nothing branches on renders as nothing. micro-org#368.
+  const seriesId = await seedSeries(db, makeBars({ count: 3 }))
+  await assert.rejects(
+    () => sql`
+      insert into bots (user_id, name, mode, series_id, strategy_id, allocation, fee_bps, equity_price_source)
+      values (${ALICE}, 'n', 'paper', ${seriesId}, 'buy_hold', 1000, 1500, 'oracle')
+    `,
+    (err: unknown) => String(err).includes('bots_equity_price_source_known'),
+  )
+  await assert.doesNotReject(
+    () => sql`
+      insert into bots (user_id, name, mode, series_id, strategy_id, allocation, fee_bps, equity_price_source)
+      values (${ALICE}, 'n', 'paper', ${seriesId}, 'buy_hold', 1000, 1500, 'administered')
+    `,
+  )
+})
+
 test('a bot cannot hold a negative balance of anything', { skip }, async () => {
   const seriesId = await seedSeries(db, makeBars({ count: 3 }))
   await assert.rejects(

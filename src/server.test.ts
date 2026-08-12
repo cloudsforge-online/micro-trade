@@ -17,7 +17,7 @@ import { Logger, Metrics, registerHttpMetrics, registerJobMetrics } from '@cloud
 import { createServer, registerServiceMetrics } from './server.ts'
 import { signEvent } from './outbox.ts'
 import { runBacktest } from './backtests.ts'
-import { LIVE_DISABLED } from './bots.ts'
+import { LIVE_DISABLED, updateBot } from './bots.ts'
 import { RATE_SCALE } from './money.ts'
 import {
   ALICE,
@@ -332,6 +332,22 @@ test('a bot is created, listed and read back with its amounts as decimal strings
   assert.equal(typeof response.body.bot.allocation, 'string')
   assert.equal(response.body.bot.allocation, '1000000')
   assert.equal(response.body.bot.status, 'draft')
+})
+
+test('a bot carries the provenance of its mark to the client, not just the number', { skip }, async () => {
+  // micro-org#368: trade-web renders this, and it can only render what the API sends. Asserted on
+  // the field's PRESENCE at null as well as on its value, because `botView` spreads the record and a
+  // field silently dropped from `COLUMNS` would come back `undefined` — which JSON omits, and which
+  // a frontend reading "no source" and "not marked yet" the same way would never notice.
+  const botId = await createBot()
+  const fresh = await call(`/v1/bots/${botId}`, { token: 'alice' })
+  assert.equal(fresh.status, 200)
+  assert.ok(Object.hasOwn(fresh.body.bot as object, 'equityPriceSource'), 'the mark reaches the client unattributed')
+  assert.equal(fresh.body.bot.equityPriceSource, null, 'an unmarked bot claimed a price source')
+
+  await updateBot(db, botId, { equity: 1_100_000n, equityPriceSource: 'administered' })
+  const marked = await call(`/v1/bots/${botId}`, { token: 'alice' })
+  assert.equal(marked.body.bot.equityPriceSource, 'administered')
 })
 
 test('an allocation sent as an unsafe JSON number is refused rather than silently truncated', { skip }, async () => {

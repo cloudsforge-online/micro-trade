@@ -19,7 +19,7 @@ import type { Principal } from '@cloudsforge/auth'
 import { TokenError, VerifierUnavailableError } from '@cloudsforge/auth'
 import { MIGRATIONS, TABLES } from './migrations.ts'
 import { registerServiceMetrics, type PrincipalVerifier } from './server.ts'
-import { RateUnavailableError, type PricingClient, type Quote } from './pricingclient.ts'
+import { RateUnavailableError, type PricingClient, type Quote, type QuoteSource } from './pricingclient.ts'
 import {
   LedgerInFlightError,
   LedgerRefusedError,
@@ -128,6 +128,14 @@ export function testClock(atMs = Date.parse('2026-07-01T00:00:00.000Z')): TestCl
 
 export interface FakePricing extends PricingClient {
   set(asset: string, midScaled: bigint, spreadBps?: number): void
+  /**
+   * The same, from an operator-set price rather than a market one.
+   *
+   * Separate from `set` rather than a fourth argument, so a test that means to exercise
+   * micro-org#368's administered case has to say so at the call site and cannot get there by
+   * leaving a default alone.
+   */
+  setAdministered(asset: string, midScaled: bigint, spreadBps?: number): void
   /** Make the asset unquotable, with the reason a caller will see. */
   unset(asset: string, reason?: string): void
 }
@@ -135,18 +143,24 @@ export interface FakePricing extends PricingClient {
 export function fakePricing(): FakePricing {
   const quotes = new Map<string, Quote>()
   const reasons = new Map<string, string>()
+  const quoted = (asset: string, midScaled: bigint, spreadBps: number, source: QuoteSource): void => {
+    const delta = (midScaled * BigInt(spreadBps)) / 10_000n
+    quotes.set(asset, {
+      assetCode: asset as never,
+      midScaled,
+      buyScaled: midScaled + delta,
+      sellScaled: midScaled - delta,
+      asOf: '2026-07-01T00:00:00.000Z',
+      source,
+    })
+    reasons.delete(asset)
+  }
   return {
     set(asset, midScaled, spreadBps = 50) {
-      const delta = (midScaled * BigInt(spreadBps)) / 10_000n
-      quotes.set(asset, {
-        assetCode: asset as never,
-        midScaled,
-        buyScaled: midScaled + delta,
-        sellScaled: midScaled - delta,
-        asOf: '2026-07-01T00:00:00.000Z',
-        source: 'fake',
-      })
-      reasons.delete(asset)
+      quoted(asset, midScaled, spreadBps, 'market')
+    },
+    setAdministered(asset, midScaled, spreadBps = 50) {
+      quoted(asset, midScaled, spreadBps, 'administered')
     },
     unset(asset, reason = 'no quote yet') {
       quotes.delete(asset)

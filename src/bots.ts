@@ -45,7 +45,12 @@ import { compileSignals } from './strategies.ts'
 import { isStrategyId, type StrategyId, type StrategyParams, type Timeframe } from './catalog.ts'
 import { loadBars, stalenessIntervals, type SeriesRecord } from './series.ts'
 import { bookFill, settleFill, applyFill, type FillSide, type PlannedFill } from './fills.ts'
-import { RateUnavailableError, priceForSide, type PricingClient } from './pricingclient.ts'
+import {
+  RateUnavailableError,
+  priceForSide,
+  type PricingClient,
+  type QuoteSource,
+} from './pricingclient.ts'
 import type { LedgerClient } from './ledgerclient.ts'
 import type { Clock } from './rng.ts'
 import { withOutbox, type Db, type Emit, type Tx } from './outbox.ts'
@@ -94,6 +99,43 @@ export const LIVE_DISABLED =
 export type BotMode = 'paper' | 'live'
 export type BotStatus = 'draft' | 'running' | 'paused' | 'stopped' | 'errored'
 
+/**
+ * What the stored `equity` was marked against.
+ *
+ * Pricing's two kinds plus `unknown` (see `QuoteSource`), and one more this service has that pricing
+ * does not: **`bar`**. A paper bot never calls pricing — it marks at `newest.c`, the close of the
+ * series' own last bar — so labelling that mark `market` would claim a quote that was never asked
+ * for. micro-org#368 is about a screen that cannot tell an operator-set price from a traded one; a
+ * third case reported as either of the first two would be the same defect wearing a fix.
+ */
+export type EquityPriceSource = QuoteSource | 'bar'
+
+const EQUITY_PRICE_SOURCES: readonly string[] = Object.freeze(['market', 'administered', 'unknown', 'bar'])
+
+/**
+ * A mark and what it was taken against, as one value.
+ *
+ * One value rather than two returns, so a caller cannot take the number and drop the provenance —
+ * which is precisely how `bots.equity` came to be stored without one.
+ */
+export interface Mark {
+  readonly equity: bigint
+  readonly priceSource: EquityPriceSource
+}
+
+/**
+ * Read the column back.
+ *
+ * A row carrying a word this build does not know becomes `unknown` rather than throwing: the value
+ * is a label on a number, and refusing to load a bot because its provenance label is unfamiliar
+ * would take a working bot off the air over a caption. `bots_equity_price_source_known` is what
+ * stops one being written in the first place.
+ */
+export function toEquityPriceSource(raw: string | null): EquityPriceSource | null {
+  if (raw === null) return null
+  return EQUITY_PRICE_SOURCES.includes(raw) ? (raw as EquityPriceSource) : 'unknown'
+}
+
 export interface BotRecord {
   readonly id: string
   readonly userId: string
@@ -108,6 +150,8 @@ export interface BotRecord {
   readonly cash: bigint
   readonly position: bigint
   readonly equity: bigint
+  /** What `equity` was marked against, or null if nothing has marked it yet. */
+  readonly equityPriceSource: EquityPriceSource | null
   readonly highWaterMark: bigint
   readonly feeBps: number
   readonly feeOwed: bigint
@@ -131,6 +175,7 @@ interface BotRow {
   readonly cash: string
   readonly position: string
   readonly equity: string
+  readonly equity_price_source: string | null
   readonly high_water_mark: string
   readonly fee_bps: number
   readonly fee_owed: string
@@ -141,8 +186,8 @@ interface BotRow {
 }
 
 const COLUMNS = `id, user_id, name, mode, status, series_id, strategy_id, params, allocation,
-  reservation_entry_id, cash, position, equity, high_water_mark, fee_bps, fee_owed, fee_paid,
-  state, last_bar_t, last_error`
+  reservation_entry_id, cash, position, equity, equity_price_source, high_water_mark, fee_bps,
+  fee_owed, fee_paid, state, last_bar_t, last_error`
 
 export function toBot(row: BotRow): BotRecord {
   if (!isStrategyId(row.strategy_id)) {
@@ -164,6 +209,7 @@ export function toBot(row: BotRow): BotRecord {
     cash: amountFrom(row.cash),
     position: amountFrom(row.position),
     equity: amountFrom(row.equity),
+    equityPriceSource: toEquityPriceSource(row.equity_price_source),
     highWaterMark: amountFrom(row.high_water_mark),
     feeBps: row.fee_bps,
     feeOwed: amountFrom(row.fee_owed),
@@ -264,6 +310,8 @@ export async function unsettledBotIds(sql: Db, limit: number): Promise<readonly 
 export interface BotPatch {
   readonly status?: BotStatus
   readonly equity?: bigint
+  /** Always set beside `equity`. A mark whose provenance is left behind is the defect, not the fix. */
+  readonly equityPriceSource?: EquityPriceSource
   readonly highWaterMark?: bigint
   readonly feeOwed?: bigint
   readonly feePaid?: bigint
@@ -282,11 +330,20 @@ export interface BotPatch {
  * Deliberately cannot write `cash` or `position` — there is no field for them. Those move only in
  * `applyFill`, in the same transaction as the fill row it claims. Making it impossible to express
  * here is cheaper than a comment asking people not to.
+ *
+ * `equity` and `equityPriceSource` travel together, and a patch carrying one without the other
+ * throws. That is the same reasoning one level down: micro-org#368 exists because a mark was stored
+ * without the thing it was marked against, and a column that a future write site may forget to fill
+ * is a column that will be null again for some rows and trustworthy for none.
  */
 export async function updateBot(sql: Db | Tx, id: string, patch: BotPatch): Promise<void> {
+  if ((patch.equity === undefined) !== (patch.equityPriceSource === undefined)) {
+    throw new Error('equity and equityPriceSource must be written together — micro-org#368')
+  }
   const set: Record<string, unknown> = {}
   if (patch.status !== undefined) set['status'] = patch.status
   if (patch.equity !== undefined) set['equity'] = patch.equity.toString()
+  if (patch.equityPriceSource !== undefined) set['equity_price_source'] = patch.equityPriceSource
   if (patch.highWaterMark !== undefined) set['high_water_mark'] = patch.highWaterMark.toString()
   if (patch.feeOwed !== undefined) set['fee_owed'] = patch.feeOwed.toString()
   if (patch.feePaid !== undefined) set['fee_paid'] = patch.feePaid.toString()
@@ -408,17 +465,26 @@ export async function tickBot(
   // The mark. A paper bot marks at the bar's own close; a live bot marks at the same oracle a fill
   // will settle against, because marking a position at anything else would make the equity curve
   // disagree with the money.
+  //
+  // `markSource` is carried alongside the number from here to the write, and is the whole of
+  // micro-org#368's producer half. It is derived HERE, at the branch that decides where the price
+  // came from, because that is the only place the answer is known — a reader asking the same
+  // question later would get today's arrangement for the asset rather than the one this mark was
+  // taken under.
   let markScaled: bigint
+  let markSource: EquityPriceSource
   let buyScaled: bigint
   let sellScaled: bigint
   if (bot.mode === 'paper') {
     markScaled = newest.c
+    markSource = 'bar'
     buyScaled = slippedPrice(newest.c, PAPER_SLIPPAGE_BPS, 'buy')
     sellScaled = slippedPrice(newest.c, PAPER_SLIPPAGE_BPS, 'sell')
   } else {
     try {
       const quote = await deps.pricing.quote(asset)
       markScaled = quote.midScaled
+      markSource = quote.source
       buyScaled = priceForSide(quote, 'buy')
       sellScaled = priceForSide(quote, 'sell')
     } catch (err) {
@@ -435,6 +501,7 @@ export async function tickBot(
   if (bot.lastBarT !== null && bot.lastBarT >= newest.t) {
     await updateBot(deps.sql, bot.id, {
       equity: equityOf(bot.cash, bot.position, asset, markScaled),
+      equityPriceSource: markSource,
       touchTick: true,
       lastError: null,
     })
@@ -546,6 +613,7 @@ export async function tickBot(
   const fresh = (await getBot(deps.sql, bot.id)) ?? bot
   await updateBot(deps.sql, bot.id, {
     equity: equityOf(fresh.cash, fresh.position, asset, markScaled),
+    equityPriceSource: markSource,
     state,
     lastBarT: newest.t,
     touchTick: true,

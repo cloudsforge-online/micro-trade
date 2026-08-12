@@ -367,6 +367,84 @@ test('a series with too few bars refuses rather than evaluating a rule on nothin
   assert.equal(await tickBot(tickDeps(), running, series), 'no_bars')
 })
 
+/* ------------------------------------------------------------------ what the mark was taken against */
+
+/**
+ * The stored equity says where its price came from — micro-org#368.
+ *
+ * ## Why this is a PAIR and not one assertion
+ *
+ * The defect is that an administered mark and a traded mark are byte-identical once stored, so the
+ * screen showing them cannot tell a number an operator typed from a number four independent sources
+ * agreed on. A test that only proves `administered` is recorded passes just as happily against a
+ * `tickBot` that hard-codes the word — which reports every mark as operator-set, the same lie
+ * pointing the other way and a worse one, because it teaches a reader to ignore the label. The two
+ * bots here differ in exactly one input, what pricing answers, and the assertion is on the
+ * difference.
+ *
+ * Read back through `getBot` rather than off the return of the tick, because the column is the
+ * artefact: `bots.equity` outlives the tick that wrote it and is what every later reader sees.
+ */
+test('two live bots marked at the same number record which of them was priced by a person', { skip }, async () => {
+  const series = await getSeries(db, seriesId)
+  assert.ok(series)
+
+  // EMBER on this estate: pricing serves it `administered`, because Hearth has no exchange listing.
+  pricing.setAdministered('BTC', 30_000n * RATE_SCALE)
+  const administered = await aBot('live')
+  assert.equal(await tickBot(tickDeps(), administered, series), 'filled')
+
+  pricing.set('BTC', 30_000n * RATE_SCALE)
+  const market = await aBot('live')
+  assert.equal(await tickBot(tickDeps(), market, series), 'filled')
+
+  const one = await getBot(db, administered.id)
+  const other = await getBot(db, market.id)
+  assert.equal(one?.equityPriceSource, 'administered')
+  assert.equal(other?.equityPriceSource, 'market')
+  assert.equal(one?.equity, other?.equity, 'the two marks must be the same number, or this proves nothing')
+})
+
+test('a paper bot marks at its own bar close and says so, rather than claiming a quote', { skip }, async () => {
+  // Unquotable on purpose: a paper bot never asks pricing, so `market` here would be a provenance
+  // for a call that was never made. `bar` is the third case the column exists to be able to state.
+  pricing.unset('BTC')
+  const bot = await aBot('paper')
+  const series = await getSeries(db, seriesId)
+  assert.ok(series)
+  assert.equal(await tickBot(tickDeps(), bot, series), 'filled')
+  assert.equal((await getBot(db, bot.id))?.equityPriceSource, 'bar')
+})
+
+test('the mark-only tick carries the provenance too, not just the one that fills', { skip }, async () => {
+  // Two write sites in `tickBot` and this is the quieter one: a running bot on a quiet market takes
+  // this branch on every tick between bars, so it is the branch that writes the equity a user is
+  // most likely to be looking at.
+  const series = await getSeries(db, seriesId)
+  assert.ok(series)
+  const bot = await aBot('live')
+  assert.equal(await tickBot(tickDeps(), bot, series), 'filled')
+
+  pricing.setAdministered('BTC', 31_000n * RATE_SCALE)
+  const filled = await getBot(db, bot.id)
+  assert.ok(filled)
+  assert.equal(await tickBot(tickDeps(), filled, series), 'marked')
+  assert.equal((await getBot(db, bot.id))?.equityPriceSource, 'administered', 'a re-mark kept the old provenance')
+})
+
+test('a bot nothing has marked yet claims no price source at all', { skip }, async () => {
+  // `insertBot` seeds `equity` from `allocation`, which is capital committed and not a valuation.
+  // Labelling that would be inventing a provenance for a number that has none.
+  const bot = await aBot('paper')
+  assert.equal(bot.equityPriceSource, null)
+})
+
+test('a mark cannot be stored without saying what it was marked against', { skip }, async () => {
+  const bot = await aBot('paper')
+  await assert.rejects(() => updateBot(db, bot.id, { equity: 1_000n }), /micro-org#368/)
+  await assert.rejects(() => updateBot(db, bot.id, { equityPriceSource: 'market' }), /micro-org#368/)
+})
+
 /* ------------------------------------------------------------------ lifecycle */
 
 test('starting a live bot reserves its capital before it is allowed to run', { skip }, async () => {
