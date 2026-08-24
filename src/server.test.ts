@@ -7,6 +7,7 @@
  * reserves capital and a retried start without a key would be a second reservation.
  */
 
+import { networkSql, type Sql as RuntimeSql } from '@cloudsforge/db'
 import assert from 'node:assert/strict'
 import test, { after, before, beforeEach } from 'node:test'
 import type { Server } from 'node:http'
@@ -89,7 +90,8 @@ before(async () => {
       : new Logger({ service: 'trade-test', level: 'fatal', sink: () => {} }),
     metrics,
     verifier,
-    sql: db,
+    sql: singleNetworkSql(db),
+    singleNetwork: 'mainnet' as const,
     producer: 'trade',
     queue: {
       async enqueue(options: { kind: string; key: string }) {
@@ -1107,3 +1109,12 @@ test('a service without the write scope may read the book but not trade on it', 
   })
   assert.equal(placed.status, 201, JSON.stringify(placed.body))
 })
+
+/**
+ * One handle, presented as the per-network selector the server now takes. The fixture runs against
+ * a single test database, so mainnet is the only configured network — which exercises the REFUSAL
+ * path for free: anything reaching for testnet throws rather than reusing this handle.
+ */
+function singleNetworkSql(db: unknown) {
+  return networkSql({ mainnet: db as RuntimeSql })
+}

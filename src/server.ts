@@ -39,6 +39,8 @@ import {
   type Principal,
 } from '@cloudsforge/auth'
 import type { Lifecycle } from '@cloudsforge/lifecycle'
+import { NetworkUnknownError, requestNetwork, type Network } from '@cloudsforge/http'
+import type { NetworkSql } from '@cloudsforge/db'
 import { Metrics, newRequestId, type Logger } from '@cloudsforge/telemetry'
 import type { JobQueue } from '@cloudsforge/jobs'
 import { STRATEGIES, findStrategy, isStrategyId, isTimeframe, normaliseParams, type Timeframe } from './catalog.ts'
@@ -144,9 +146,24 @@ export interface ServerDeps {
   readonly logger: Logger
   readonly metrics: Metrics
   readonly verifier: PrincipalVerifier
-  readonly sql: Db
+  /**
+   * The per-network SELECTOR, not a handle. Routes use `ctx.sql`; `NetworkSql` has no query
+   * methods, so reaching for the process-wide handle does not compile.
+   */
+  readonly sql: NetworkSql
+  /**
+   * The network to assume when no `CF-Network` arrives, or `undefined` to refuse. `CF_NETWORK_SINGLE`,
+   * for `pnpm dev`, which has no gateway in front of it. Never set in production.
+   */
+  readonly singleNetwork?: Network
   readonly producer: string
+  /**
+   * Boot-time value; `forRequest` replaces it with the queue for this request's network.
+   * An enqueue is a WRITE, and a job claimed by a runner holding the other estate's handle
+   * applies to the other estate's rows and completes without complaint.
+   */
   readonly queue: Pick<JobQueue, 'enqueue'>
+  readonly queueFor: (network: Network) => Pick<JobQueue, 'enqueue'>
   readonly ledger: LedgerClient
   readonly pricing: PricingClient
   readonly clock: Clock
@@ -232,7 +249,34 @@ interface RequestContext {
   readonly requestId: string
   readonly log: Logger
   readonly params: Record<string, string>
+  /**
+   * The network THIS REQUEST belongs to, from the `CF-Network` header the gateway stamped.
+   *
+   * Not a property of the process: one pod serves both estates since the network consolidation
+   * (micro-deploy `docs/network-consolidation.md`), so "which network am I" has no answer.
+   */
+  readonly network: Network
+  /**
+   * The database handle for `network`, resolved ONCE, at the edge of the request.
+   *
+   * Every route uses this rather than reaching for the process-wide handle, because a wrong handle
+   * is not an error — it is a query that SUCCEEDS against the other estate's rows and says nothing.
+   * `deps.sql` is a `NetworkSql` with no query methods, so the mistake does not compile.
+   */
+  readonly sql: Db
 }
+
+/**
+ * Routes that answer without belonging to a network.
+ *
+ * Kubelet probes the first two and Prometheus scrapes the third; none arrives through the gateway,
+ * so none carries `CF-Network`. Refusing them turns a data-isolation rule into a CrashLoopBackOff —
+ * which is exactly what agora's first build did: 500 on every probe, container never ready.
+ *
+ * A literal SET rather than a prefix, because this is an exemption from a data boundary and
+ * widening it should be a deliberate edit. Every member must answer without touching the database.
+ */
+const OPERATIONAL_ROUTES: ReadonlySet<string> = new Set(['/livez', '/readyz', '/metrics'])
 
 interface Route {
   readonly method: string
@@ -326,25 +370,71 @@ export function createServer(deps: ServerDeps): Server {
     inFlight += 1
     deps.metrics.set('http_requests_in_flight', inFlight)
 
-    const finish = (status: number): void => {
+    const finish = (status: number, metricNetwork: string): void => {
       inFlight -= 1
       deps.metrics.set('http_requests_in_flight', inFlight)
       const durationMs = Number(process.hrtime.bigint() - startedAt) / 1e6
-      deps.metrics.increment('http_requests_total', { method, route: routeLabel, status: String(status) })
-      deps.metrics.observe('http_request_duration_ms', durationMs, { method, route: routeLabel })
+      deps.metrics.increment('http_requests_total', {
+        method,
+        route: routeLabel,
+        status: String(status),
+        // One target now serves both estates, so the network has to be on the SERIES. Labelled
+        // per target it would say nothing — micro-org#398 in a form nothing could recover.
+        network: metricNetwork,
+      })
+      deps.metrics.observe('http_request_duration_ms', durationMs, {
+        method,
+        route: routeLabel,
+        network: metricNetwork,
+      })
     }
 
-    void handle(matched, { req, url, requestId, log, params }, deps)
+    // ── THE NETWORK, THEN THE HANDLE, BEFORE ANY ROUTE RUNS ──────────────────────────────────
+    //
+    // `requestNetwork` REFUSES an unstamped request rather than assuming mainnet: a 500 is a
+    // routing fault made loud, where a default is a cross-network write nothing would ever flag.
+    //
+    // The operational endpoints are exempt because kubelet and Prometheus do not come through the
+    // gateway and never send the header. Refusing them makes the pod never become ready.
+    const networkless = matched !== undefined && OPERATIONAL_ROUTES.has(matched.path)
+    let network: Network
+    try {
+      network = networkless
+        ? (deps.singleNetwork ?? deps.sql.networks[0] ?? 'mainnet')
+        : requestNetwork(req.headers, deps.singleNetwork ? { fallback: deps.singleNetwork } : {})
+    } catch (err) {
+      log.error('request carries no usable network', {
+        err: err instanceof NetworkUnknownError ? err.message : err,
+      })
+      send(
+        res,
+        errorReply(500, 'network_unknown', 'this request could not be attributed to a network', requestId),
+        requestId,
+      )
+      finish(500, 'unknown')
+      return
+    }
+
+    const sql = deps.sql.for(network) as unknown as Db
+    void handle(matched, { req, url, requestId, log, params, network, sql }, forRequest(deps, network))
       .then((reply) => {
         send(res, reply, requestId)
-        finish(reply.status)
+        finish(reply.status, network)
       })
       .catch((err: unknown) => {
         log.error('request handler threw after mapping', { err })
         send(res, errorReply(500, 'internal', 'the request could not be completed', requestId), requestId)
-        finish(500)
+        finish(500, network)
       })
   })
+}
+
+/**
+ * The deps a REQUEST sees: everything that closed over a database handle at boot, rebuilt for this
+ * request's network. `sql` stays the selector on `deps` because routes read `ctx.sql`.
+ */
+function forRequest(deps: ServerDeps, network: Network): ServerDeps {
+  return { ...deps, queue: deps.queueFor(network) }
 }
 
 async function handle(route: Route | undefined, ctx: RequestContext, deps: ServerDeps): Promise<Reply> {
@@ -541,7 +631,7 @@ function buildRoutes(): Route[] {
 
     define('GET', '/v1/series', async (ctx, deps) => {
       await authenticate(ctx, deps)
-      return { status: 200, body: { series: await listSeries(deps.sql) } }
+      return { status: 200, body: { series: await listSeries(ctx.sql) } }
     }),
 
     define('POST', '/v1/series', async (ctx, deps) => {
@@ -553,7 +643,7 @@ function buildRoutes(): Route[] {
       const timeframe = requireString(body, 'timeframe', 8)
       if (!isTimeframe(timeframe)) throw new BadRequestError(`unknown timeframe ${timeframe}`)
       const source = requireString(body, 'source', 64)
-      const series = await registerSeries(deps.sql, { symbol, assetCode, timeframe, source })
+      const series = await registerSeries(ctx.sql, { symbol, assetCode, timeframe, source })
       return { status: 201, body: { series } }
     }),
 
@@ -561,7 +651,7 @@ function buildRoutes(): Route[] {
       const principal = await authenticate(ctx, deps)
       requireOperator(principal)
       const seriesId = uuidParam(ctx, 'id')
-      const series = await getSeries(deps.sql, seriesId)
+      const series = await getSeries(ctx.sql, seriesId)
       if (!series) throw new NotFoundError('series not found')
 
       const body = await readJson(ctx.req)
@@ -571,7 +661,7 @@ function buildRoutes(): Route[] {
 
       const bars = raw.map((entry) => parseBar(entry, series.timeframe, deps.clock))
       const key = idempotencyKeyOf(ctx)
-      const outcome = await withIdempotency<{ accepted: number }>(deps.sql, {
+      const outcome = await withIdempotency<{ accepted: number }>(ctx.sql, {
         originatingService: deps.producer,
         route: 'POST /v1/series/:id/bars',
         clientKey: key,
@@ -589,7 +679,7 @@ function buildRoutes(): Route[] {
       const principal = await authenticate(ctx, deps)
       if (principal.kind === 'service') requireScope(principal, READ_SCOPE)
       const userId = ownerOf(ctx, principal)
-      const backtests = await listBacktests(deps.sql, userId, 100)
+      const backtests = await listBacktests(ctx.sql, userId, 100)
       return { status: 200, body: { backtests: backtests.map(backtestView) } }
     }),
 
@@ -597,7 +687,7 @@ function buildRoutes(): Route[] {
       const principal = await authenticate(ctx, deps)
       if (principal.kind === 'service') requireScope(principal, READ_SCOPE)
       const userId = ownerOf(ctx, principal)
-      const backtest = await getOwnedBacktest(deps.sql, uuidParam(ctx, 'id'), userId)
+      const backtest = await getOwnedBacktest(ctx.sql, uuidParam(ctx, 'id'), userId)
       if (!backtest) throw new NotFoundError('backtest not found')
       return { status: 200, body: { backtest: backtestView(backtest) } }
     }),
@@ -617,7 +707,7 @@ function buildRoutes(): Route[] {
       const principal = await authenticate(ctx, deps)
       if (principal.kind === 'service') requireScope(principal, READ_SCOPE)
       const userId = ownerOf(ctx, principal)
-      const result = await getOwnedBacktestResult(deps.sql, uuidParam(ctx, 'id'), userId)
+      const result = await getOwnedBacktestResult(ctx.sql, uuidParam(ctx, 'id'), userId)
       if (!result) throw new NotFoundError('backtest not found')
       if (result.status !== 'complete' || !result.fills || !result.equity) {
         return errorReply(
@@ -637,7 +727,7 @@ function buildRoutes(): Route[] {
       const userId = ownerOf(ctx, principal, body)
 
       const seriesId = requireUuid(body, 'seriesId')
-      const series = await getSeries(deps.sql, seriesId)
+      const series = await getSeries(ctx.sql, seriesId)
       if (!series) throw new NotFoundError('series not found')
 
       const strategyId = requireString(body, 'strategyId', 64)
@@ -651,7 +741,7 @@ function buildRoutes(): Route[] {
       const seed = readSeed(body)
 
       const key = idempotencyKeyOf(ctx)
-      const outcome = await withIdempotency<{ backtestId: string; status: string }>(deps.sql, {
+      const outcome = await withIdempotency<{ backtestId: string; status: string }>(ctx.sql, {
         originatingService: deps.producer,
         route: 'POST /v1/backtests',
         clientKey: key,
@@ -710,7 +800,7 @@ function buildRoutes(): Route[] {
       const principal = await authenticate(ctx, deps)
       if (principal.kind === 'service') requireScope(principal, READ_SCOPE)
       const userId = ownerOf(ctx, principal)
-      const bots = await listBots(deps.sql, userId, 100)
+      const bots = await listBots(ctx.sql, userId, 100)
       return { status: 200, body: { bots: bots.map(botView) } }
     }),
 
@@ -721,7 +811,7 @@ function buildRoutes(): Route[] {
 
     define('GET', '/v1/bots/:id/fills', async (ctx, deps) => {
       const { bot } = await ownedBot(ctx, deps, READ_SCOPE)
-      const fills = await listFills(deps.sql, bot.id, 200)
+      const fills = await listFills(ctx.sql, bot.id, 200)
       return {
         status: 200,
         body: {
@@ -739,7 +829,7 @@ function buildRoutes(): Route[] {
 
     define('GET', '/v1/bots/:id/settlements', async (ctx, deps) => {
       const { bot } = await ownedBot(ctx, deps, READ_SCOPE)
-      const settlements = await listSettlements(deps.sql, bot.id, 200)
+      const settlements = await listSettlements(ctx.sql, bot.id, 200)
       return {
         status: 200,
         body: {
@@ -767,7 +857,7 @@ function buildRoutes(): Route[] {
       const mode = requireString(body, 'mode', 8)
       if (mode !== 'paper' && mode !== 'live') throw new BadRequestError("mode must be 'paper' or 'live'")
       const seriesId = requireUuid(body, 'seriesId')
-      if (!(await getSeries(deps.sql, seriesId))) throw new NotFoundError('series not found')
+      if (!(await getSeries(ctx.sql, seriesId))) throw new NotFoundError('series not found')
       const strategyId = requireString(body, 'strategyId', 64)
       if (!findStrategy(strategyId)) throw new NotFoundError(`unknown strategy ${strategyId}`)
       if (!isStrategyId(strategyId)) throw new NotFoundError(`unknown strategy ${strategyId}`)
@@ -777,7 +867,7 @@ function buildRoutes(): Route[] {
       const feeBps = readBps(body, 'feeBps', 1_500)
 
       const key = idempotencyKeyOf(ctx)
-      const outcome = await withIdempotency<{ botId: string }>(deps.sql, {
+      const outcome = await withIdempotency<{ botId: string }>(ctx.sql, {
         originatingService: deps.producer,
         route: 'POST /v1/bots',
         clientKey: key,
@@ -824,7 +914,7 @@ function buildRoutes(): Route[] {
       const key = idempotencyKeyOf(ctx)
       const correlationId = ctx.requestId
 
-      const outcome = await withIdempotency<{ botId: string; status: string; deferred?: string }>(deps.sql, {
+      const outcome = await withIdempotency<{ botId: string; status: string; deferred?: string }>(ctx.sql, {
         originatingService: deps.producer,
         route: 'POST /v1/bots/:id/actions',
         clientKey: key,
@@ -833,13 +923,13 @@ function buildRoutes(): Route[] {
           switch (action) {
             case 'start': {
               const started = await startBot(
-                { sql: deps.sql, ledger: deps.ledger, producer: deps.producer, correlationId, liveEnabled: deps.liveEnabled },
+                { sql: ctx.sql, ledger: deps.ledger, producer: deps.producer, correlationId, liveEnabled: deps.liveEnabled },
                 bot,
               )
               return { response: { botId: bot.id, status: started.status }, subjectUrn: `cf:trade:bot:${bot.id}` }
             }
             case 'pause': {
-              await pauseBot(deps.sql, deps.producer, bot)
+              await pauseBot(ctx.sql, deps.producer, bot)
               return { response: { botId: bot.id, status: 'paused' }, subjectUrn: `cf:trade:bot:${bot.id}` }
             }
             case 'stop': {
@@ -848,14 +938,14 @@ function buildRoutes(): Route[] {
                 producer: string
                 markEquity: (b: BotRecord) => Promise<Mark | null>
               } = {
-                sql: deps.sql,
+                sql: ctx.sql,
                 ledger: deps.ledger,
                 clock: deps.clock,
                 logger: ctx.log,
                 periodSeconds: deps.settlementPeriodSeconds,
                 correlationId,
                 producer: deps.producer,
-                markEquity: (b) => markEquityAt(deps, b),
+                markEquity: (b) => markEquityAt(ctx.sql, deps, b),
               }
               const result = await stopBot(feeDeps, bot)
               return {
@@ -907,7 +997,7 @@ function buildRoutes(): Route[] {
       if (!UUID.test(eventId)) throw new BadRequestError('the event id must be a uuid')
       if (!SUBSCRIBED_TOPICS.has(topic)) return { status: 202, body: { status: 'ignored' } }
 
-      const outcome = await withInbox(deps.sql, topic, eventId, async (tx) => {
+      const outcome = await withInbox(ctx.sql, topic, eventId, async (tx) => {
         // 03 §2 rule 6, and 17 §2: every service storing `user_id` subscribes to this and
         // acknowledges within its stated SLA. Bots are deleted; their fills and settlements go with
         // them by cascade. The idempotency claims are kept — they name a urn, not a user, and they
@@ -958,7 +1048,7 @@ function exchangeRoutes(): Route[] {
   return [
     exchangeRoute('GET', '/v1/exchange/markets', async (ctx, deps) => {
       await reader(ctx, deps)
-      const markets = await listMarkets(deps.sql)
+      const markets = await listMarkets(ctx.sql)
       return { status: 200, body: { markets: markets.map(marketView) } }
     }),
 
@@ -971,10 +1061,10 @@ function exchangeRoutes(): Route[] {
      */
     exchangeRoute('GET', '/v1/exchange/markets/:symbol', async (ctx, deps) => {
       await reader(ctx, deps)
-      const market = await resolveMarket(deps, ctx.params['symbol'])
+      const market = await resolveMarket(ctx.sql, ctx.params['symbol'])
       const [bbo, day] = await Promise.all([
-        bestBidOffer(deps.sql, market.id),
-        ticker(deps.sql, market.id, deps.clock.now()),
+        bestBidOffer(ctx.sql, market.id),
+        ticker(ctx.sql, market.id, deps.clock.now()),
       ])
       return {
         status: 200,
@@ -988,32 +1078,32 @@ function exchangeRoutes(): Route[] {
 
     exchangeRoute('GET', '/v1/exchange/markets/:symbol/depth', async (ctx, deps) => {
       await reader(ctx, deps)
-      const market = await resolveMarket(deps, ctx.params['symbol'])
-      const depth = await marketDepth(deps.sql, market.id, limitParam(ctx, 50, 500))
+      const market = await resolveMarket(ctx.sql, ctx.params['symbol'])
+      const depth = await marketDepth(ctx.sql, market.id, limitParam(ctx, 50, 500))
       return { status: 200, body: { marketId: market.id, symbol: market.symbol, depth: depthView(depth) } }
     }),
 
     exchangeRoute('GET', '/v1/exchange/markets/:symbol/ticker', async (ctx, deps) => {
       await reader(ctx, deps)
-      const market = await resolveMarket(deps, ctx.params['symbol'])
-      return { status: 200, body: { ticker: tickerView(await ticker(deps.sql, market.id, deps.clock.now())) } }
+      const market = await resolveMarket(ctx.sql, ctx.params['symbol'])
+      return { status: 200, body: { ticker: tickerView(await ticker(ctx.sql, market.id, deps.clock.now())) } }
     }),
 
     exchangeRoute('GET', '/v1/exchange/markets/:symbol/trades', async (ctx, deps) => {
       await reader(ctx, deps)
-      const market = await resolveMarket(deps, ctx.params['symbol'])
-      const trades = await recentTrades(deps.sql, market.id, limitParam(ctx, 50, 500))
+      const market = await resolveMarket(ctx.sql, ctx.params['symbol'])
+      const trades = await recentTrades(ctx.sql, market.id, limitParam(ctx, 50, 500))
       return { status: 200, body: { marketId: market.id, trades: trades.map(publicTradeView) } }
     }),
 
     exchangeRoute('GET', '/v1/exchange/markets/:symbol/candles', async (ctx, deps) => {
       await reader(ctx, deps)
-      const market = await resolveMarket(deps, ctx.params['symbol'])
+      const market = await resolveMarket(ctx.sql, ctx.params['symbol'])
       const interval = ctx.url.searchParams.get('interval') ?? '1m'
       if (!isCandleInterval(interval)) {
         throw new BadRequestError(`interval must be one of ${Object.keys(CANDLE_INTERVALS).join(', ')}`)
       }
-      const rows = await candles(deps.sql, market.id, interval, limitParam(ctx, 200, 1_000))
+      const rows = await candles(ctx.sql, market.id, interval, limitParam(ctx, 200, 1_000))
       return { status: 200, body: { marketId: market.id, interval, candles: rows.map(candleView) } }
     }),
 
@@ -1033,20 +1123,20 @@ function exchangeRoutes(): Route[] {
       const principal = await writer(ctx, deps, 'order.place')
       const body = await readJson(ctx.req)
       const userId = ownerOf(ctx, principal, body)
-      const market = await marketFromBody(deps, body)
+      const market = await marketFromBody(ctx.sql, body)
       const input = placementFrom(userId, market, body, deps.clock)
       validatePlacement(market, input)
 
       const key = idempotencyKeyOf(ctx)
       const outcome = await withIdempotency<{ order: Record<string, unknown>; fills: Record<string, unknown>[] }>(
-        deps.sql,
+        ctx.sql,
         {
           originatingService: deps.producer,
           route: 'POST /v1/exchange/orders',
           clientKey: key,
           requestHash: requestFingerprint(placementFingerprint(input)),
           run: async (tx, _storedKey, emit) => {
-            const result = await placeOrderIn(tx, emit, { sql: deps.sql, clock: deps.clock }, input)
+            const result = await placeOrderIn(tx, emit, { sql: ctx.sql, clock: deps.clock }, input)
             // Filtered to the caller's own side. A placement can print trades that belong to other
             // customers — a stop of theirs that this order's price fired — and those are not this
             // caller's to see.
@@ -1077,23 +1167,23 @@ function exchangeRoutes(): Route[] {
     exchangeRoute('GET', '/v1/exchange/orders', async (ctx, deps) => {
       const principal = await reader(ctx, deps)
       const userId = ownerOf(ctx, principal)
-      const market = await marketFromQuery(deps, ctx)
-      const orders = await listOrders(deps.sql, {
+      const market = await marketFromQuery(ctx)
+      const orders = await listOrders(ctx.sql, {
         userId,
         marketId: market?.id,
         open: ctx.url.searchParams.get('open') === 'true',
         limit: limitParam(ctx, 100, 500),
       })
-      const symbols = await symbolIndex(deps, orders)
+      const symbols = await symbolIndex(ctx.sql, orders)
       return { status: 200, body: { orders: orders.map((order) => orderView(symbols.get(order.marketId) ?? null, order)) } }
     }),
 
     exchangeRoute('GET', '/v1/exchange/orders/:id', async (ctx, deps) => {
       const principal = await reader(ctx, deps)
       const userId = ownerOf(ctx, principal)
-      const order = await getOwnedOrder(deps.sql, uuidParam(ctx, 'id'), userId)
+      const order = await getOwnedOrder(ctx.sql, uuidParam(ctx, 'id'), userId)
       if (!order) throw new NotFoundError('order not found')
-      return { status: 200, body: { order: orderView(await getMarket(deps.sql, order.marketId), order) } }
+      return { status: 200, body: { order: orderView(await getMarket(ctx.sql, order.marketId), order) } }
     }),
 
     /**
@@ -1106,9 +1196,9 @@ function exchangeRoutes(): Route[] {
     exchangeRoute('GET', '/v1/exchange/orders/:id/events', async (ctx, deps) => {
       const principal = await reader(ctx, deps)
       const userId = ownerOf(ctx, principal)
-      const order = await getOwnedOrder(deps.sql, uuidParam(ctx, 'id'), userId)
+      const order = await getOwnedOrder(ctx.sql, uuidParam(ctx, 'id'), userId)
       if (!order) throw new NotFoundError('order not found')
-      const events = await listOrderEvents(deps.sql, order.id)
+      const events = await listOrderEvents(ctx.sql, order.id)
       return { status: 200, body: { orderId: order.id, events: events.map(orderEventView) } }
     }),
 
@@ -1116,10 +1206,10 @@ function exchangeRoutes(): Route[] {
       const principal = await writer(ctx, deps, 'order.cancel')
       const userId = ownerOf(ctx, principal)
       const order = await cancelOrder(
-        { sql: deps.sql, clock: deps.clock },
+        { sql: ctx.sql, clock: deps.clock },
         { userId, orderId: uuidParam(ctx, 'id') },
       )
-      return { status: 200, body: { order: orderView(await getMarket(deps.sql, order.marketId), order) } }
+      return { status: 200, body: { order: orderView(await getMarket(ctx.sql, order.marketId), order) } }
     }),
 
     exchangeRoute('POST', '/v1/exchange/orders/cancel-all', async (ctx, deps) => {
@@ -1128,9 +1218,9 @@ function exchangeRoutes(): Route[] {
       const userId = ownerOf(ctx, principal, body)
       const market = body['marketId'] === undefined && body['symbol'] === undefined
         ? null
-        : await marketFromBody(deps, body)
+        : await marketFromBody(ctx.sql, body)
       const key = idempotencyKeyOf(ctx)
-      const outcome = await withIdempotency<{ cancelled: Record<string, unknown>[] }>(deps.sql, {
+      const outcome = await withIdempotency<{ cancelled: Record<string, unknown>[] }>(ctx.sql, {
         originatingService: deps.producer,
         route: 'POST /v1/exchange/orders/cancel-all',
         clientKey: key,
@@ -1149,15 +1239,15 @@ function exchangeRoutes(): Route[] {
     exchangeRoute('GET', '/v1/exchange/fills', async (ctx, deps) => {
       const principal = await reader(ctx, deps)
       const userId = ownerOf(ctx, principal)
-      const market = await marketFromQuery(deps, ctx)
-      const fills = await listOwnFills(deps.sql, userId, market?.id ?? null, limitParam(ctx, 100, 500))
+      const market = await marketFromQuery(ctx)
+      const fills = await listOwnFills(ctx.sql, userId, market?.id ?? null, limitParam(ctx, 100, 500))
       return { status: 200, body: { fills: fills.map(fillView) } }
     }),
 
     exchangeRoute('GET', '/v1/exchange/balances', async (ctx, deps) => {
       const principal = await reader(ctx, deps)
       const userId = ownerOf(ctx, principal)
-      const balances = await listBalances(deps.sql, userId)
+      const balances = await listBalances(ctx.sql, userId)
       return { status: 200, body: { balances: balances.map(balanceView) } }
     }),
 
@@ -1190,7 +1280,7 @@ function exchangeRoutes(): Route[] {
       if (amount <= 0n) throw new BadRequestError('amount must be positive')
 
       const key = idempotencyKeyOf(ctx)
-      const outcome = await withIdempotency<{ transferId: string }>(deps.sql, {
+      const outcome = await withIdempotency<{ transferId: string }>(ctx.sql, {
         originatingService: deps.producer,
         route: 'POST /v1/exchange/transfers',
         clientKey: key,
@@ -1201,12 +1291,12 @@ function exchangeRoutes(): Route[] {
         },
       })
 
-      const booked = await getTransferById(deps.sql, outcome.result.transferId)
+      const booked = await getTransferById(ctx.sql, outcome.result.transferId)
       if (!booked) throw new NotFoundError('transfer not found')
       const settled =
         booked.status === 'pending' || booked.status === 'unresolved'
           ? await settleTransfer(
-              { sql: deps.sql, ledger: deps.ledger, correlationId: ctx.requestId },
+              { sql: ctx.sql, ledger: deps.ledger, correlationId: ctx.requestId },
               booked,
             )
           : { status: booked.status, transfer: booked }
@@ -1226,7 +1316,7 @@ function exchangeRoutes(): Route[] {
     exchangeRoute('GET', '/v1/exchange/transfers', async (ctx, deps) => {
       const principal = await reader(ctx, deps)
       const userId = ownerOf(ctx, principal)
-      const transfers = await listTransfers(deps.sql, userId, limitParam(ctx, 100, 500))
+      const transfers = await listTransfers(ctx.sql, userId, limitParam(ctx, 100, 500))
       return { status: 200, body: { transfers: transfers.map(transferView) } }
     }),
 
@@ -1241,18 +1331,18 @@ function exchangeRoutes(): Route[] {
     exchangeRoute('POST', '/v1/exchange/markets/:symbol/status', async (ctx, deps) => {
       const principal = await authenticate(ctx, deps)
       requireOperator(principal)
-      const market = await resolveMarket(deps, ctx.params['symbol'])
+      const market = await resolveMarket(ctx.sql, ctx.params['symbol'])
       const body = await readJson(ctx.req)
       const status = requireString(body, 'status', 16)
       if (!isMarketStatus(status)) throw new BadRequestError(`status must be one of ${MARKET_STATUS_LIST}`)
       const key = idempotencyKeyOf(ctx)
-      const outcome = await withIdempotency<{ market: Record<string, unknown> }>(deps.sql, {
+      const outcome = await withIdempotency<{ market: Record<string, unknown> }>(ctx.sql, {
         originatingService: deps.producer,
         route: 'POST /v1/exchange/markets/:symbol/status',
         clientKey: key,
         requestHash: requestFingerprint({ marketId: market.id, status }),
         run: async () => {
-          const updated = await setMarketStatus(deps.sql, market.id, status)
+          const updated = await setMarketStatus(ctx.sql, market.id, status)
           if (!updated) throw new NotFoundError('market not found')
           return { response: { market: marketView(updated) }, subjectUrn: `cf:trade:market:${market.id}` }
         },
@@ -1274,7 +1364,7 @@ const MARKET_STATUS_LIST = 'active, post_only, cancel_only, halted'
 async function reader(ctx: RequestContext, deps: ServerDeps): Promise<Principal> {
   const principal = await authenticate(ctx, deps)
   if (principal.kind === 'service') requireScope(principal, READ_SCOPE)
-  await enforceRate(deps.sql, 'market.read', rateSubject(principal), deps.clock.now())
+  await enforceRate(ctx.sql, 'market.read', rateSubject(principal), deps.clock.now())
   return principal
 }
 
@@ -1282,7 +1372,7 @@ async function reader(ctx: RequestContext, deps: ServerDeps): Promise<Principal>
 async function writer(ctx: RequestContext, deps: ServerDeps, action: RateAction): Promise<Principal> {
   const principal = await authenticate(ctx, deps)
   if (principal.kind === 'service') requireScope(principal, WRITE_SCOPE)
-  await enforceRate(deps.sql, action, rateSubject(principal), deps.clock.now())
+  await enforceRate(ctx.sql, action, rateSubject(principal), deps.clock.now())
   return principal
 }
 
@@ -1304,25 +1394,25 @@ function rateSubject(principal: Principal): string {
  * what a person has, and requiring a lookup call before every other call would be a worse API than
  * one regex.
  */
-async function resolveMarket(deps: ServerDeps, raw: string | undefined): Promise<Market> {
+async function resolveMarket(sql: Db, raw: string | undefined): Promise<Market> {
   if (!raw) throw new BadRequestError('a market symbol or id is required')
   const market = UUID.test(raw)
-    ? await getMarket(deps.sql, raw)
-    : await getMarketBySymbol(deps.sql, raw)
+    ? await getMarket(sql, raw)
+    : await getMarketBySymbol(sql, raw)
   if (!market) throw new NotFoundError(`no market ${raw}`)
   return market
 }
 
-async function marketFromBody(deps: ServerDeps, body: Record<string, unknown>): Promise<Market> {
+async function marketFromBody(sql: Db, body: Record<string, unknown>): Promise<Market> {
   const named = body['marketId'] ?? body['symbol']
   if (typeof named !== 'string') throw new BadRequestError('name the market by marketId or by symbol')
-  return resolveMarket(deps, named.trim())
+  return resolveMarket(sql, named.trim())
 }
 
 /** The optional `?market=` filter, as a market or nothing. */
-async function marketFromQuery(deps: ServerDeps, ctx: RequestContext): Promise<Market | null> {
+async function marketFromQuery(ctx: RequestContext): Promise<Market | null> {
   const named = ctx.url.searchParams.get('market') ?? ctx.url.searchParams.get('marketId')
-  return named ? resolveMarket(deps, named) : null
+  return named ? resolveMarket(ctx.sql, named) : null
 }
 
 /**
@@ -1331,10 +1421,10 @@ async function marketFromQuery(deps: ServerDeps, ctx: RequestContext): Promise<M
  * A per-order lookup would be N queries to put a symbol on a list, and the list is the busiest read
  * surface the exchange has.
  */
-async function symbolIndex(deps: ServerDeps, orders: readonly OrderRecord[]): Promise<Map<string, Market>> {
+async function symbolIndex(sql: Db, orders: readonly OrderRecord[]): Promise<Map<string, Market>> {
   const index = new Map<string, Market>()
   for (const id of new Set(orders.map((order) => order.marketId))) {
-    const market = await getMarket(deps.sql, id)
+    const market = await getMarket(sql, id)
     if (market) index.set(id, market)
   }
   return index
@@ -1631,8 +1721,8 @@ function transferView(transfer: TransferRecord): Record<string, unknown> {
  * later. This path always asks pricing, so `bar` cannot arise here — a stop re-marks a paper bot
  * against the oracle too, which is the same price its final assessment is computed from.
  */
-async function markEquityAt(deps: ServerDeps, bot: BotRecord): Promise<Mark | null> {
-  const series = await getSeries(deps.sql, bot.seriesId)
+async function markEquityAt(sql: Db, deps: ServerDeps, bot: BotRecord): Promise<Mark | null> {
+  const series = await getSeries(sql, bot.seriesId)
   if (!series) return null
   try {
     const { equityOf } = await import('./money.ts')
@@ -1677,7 +1767,7 @@ async function ownedBot(
   const principal = await authenticate(ctx, deps)
   if (principal.kind === 'service') requireScope(principal, scope)
   const userId = ownerOf(ctx, principal)
-  const bot = await getOwnedBot(deps.sql, uuidParam(ctx, 'id'), userId)
+  const bot = await getOwnedBot(ctx.sql, uuidParam(ctx, 'id'), userId)
   if (!bot) throw new NotFoundError('bot not found')
   return { principal, bot }
 }
