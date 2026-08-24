@@ -98,6 +98,13 @@ before(async () => {
         enqueued.push({ kind: options.kind, key: options.key })
       },
     },
+    // One queue, presented as the per-network selector. The fixture runs against a single database,
+    // so both estates resolve to it — what is under test is that a route ASKS for a network.
+    queueFor: () => ({
+      async enqueue(options: { kind: string; key: string }) {
+        enqueued.push({ kind: options.kind, key: options.key })
+      },
+    }),
     // Read through getters so `beforeEach` can replace the fakes without rebuilding the server.
     get ledger() {
       return ledger
