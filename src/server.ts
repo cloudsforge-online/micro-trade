@@ -415,8 +415,33 @@ export function createServer(deps: ServerDeps): Server {
       return
     }
 
-    const sql = deps.sql.for(network) as unknown as Db
-    void handle(matched, { req, url, requestId, log, params, network, sql }, forRequest(deps, network))
+    // ── BUILT INSIDE THE TRY, AND THAT IS NOT DEFENSIVE PADDING ───────────────────────────────
+    //
+    // `deps.sql.for()` and `forRequest()` are called BEFORE `handle` returns a promise, so a throw
+    // from either one propagates out of the `void` expression — past the `.catch` that has not been
+    // attached yet — and the listener returns having sent NOTHING. The socket then hangs until the
+    // client gives up.
+    //
+    // That is not hypothetical: a fixture missing `queueFor` made every request in this suite hang
+    // instead of failing, and the CI job ran for fifty minutes before anyone looked. A wiring
+    // mistake should answer 500 immediately, which is a thing somebody debugs in a minute.
+    let requestSql: Db
+    let requestDeps: ServerDeps
+    try {
+      requestSql = deps.sql.for(network) as unknown as Db
+      requestDeps = forRequest(deps, network)
+    } catch (err) {
+      log.error('could not build the per-request dependencies', { err, network })
+      send(
+        res,
+        errorReply(500, 'internal', 'the request could not be completed', requestId),
+        requestId,
+      )
+      finish(500, network)
+      return
+    }
+
+    void handle(matched, { req, url, requestId, log, params, network, sql: requestSql }, requestDeps)
       .then((reply) => {
         send(res, reply, requestId)
         finish(reply.status, network)
