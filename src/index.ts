@@ -15,7 +15,7 @@
  */
 
 import postgres from 'postgres'
-import { assertSchemaAtLeast, type Sql as DbSql } from '@cloudsforge/db'
+import { assertSchemaAtLeast, type Sql as DbSql , networkSql, type Sql as RuntimeSql } from '@cloudsforge/db'
 import { JobQueue, JobRunner, type Sql as JobsSql } from '@cloudsforge/jobs'
 import { Verifier } from '@cloudsforge/auth'
 import { Lifecycle, httpProbe, installSignalHandlers, postgresProbe } from '@cloudsforge/lifecycle'
@@ -49,12 +49,21 @@ logger.info('starting', { version: env.version, schemaVersion: SCHEMA_VERSION, l
 
 // 3. The database pool. Opened before the schema assertion because the assertion is a query, and
 //    before the Lifecycle because the readiness probe closes over it.
-const sql = postgres(env.databaseUrl, {
+const poolOptions = {
   max: env.databasePoolMax,
   // postgres.js writes notices to stderr as unstructured text by default, which is how a connection
   // string ends up in a log the collector cannot parse.
   onnotice: () => {},
-})
+}
+const sql = postgres(env.databaseUrl, poolOptions)
+
+// ── ONE HANDLE PER NETWORK THIS DEPLOYMENT SERVES ────────────────────────────────────────────
+//
+// `TRADE_DATABASE_URL_TESTNET` unset is the single-network case, which is every deployment until the
+// consolidation reaches this service. `networkSql` then holds one handle and REFUSES a testnet
+// request rather than answering it out of mainnet rows — substituting would be a query that
+// SUCCEEDS against the other estate and says nothing.
+const sqlTestnet = env.databaseUrlTestnet ? postgres(env.databaseUrlTestnet, poolOptions) : undefined
 const db = sql as unknown as Db
 
 // 4. Assert the schema. This does **not** migrate. Failing here rather than serving is the point: a
@@ -140,6 +149,26 @@ const pricing = httpPricingClient({
   clock: systemClock,
 })
 
+// ── ONE PLANE PER NETWORK ───────────────────────────────────────────────────────────────────
+//
+// Pool, handle and queue together. The QUEUE is per-network as much as the pool is: an enqueue is
+// a WRITE, and a job claimed by a runner holding the other estate's handle applies to the other
+// estate's rows and leaves a completed row behind saying it went exactly as intended.
+const queueFor = (handle: typeof sql) =>
+  new JobQueue(handle as unknown as JobsSql, { owner: env.instanceId })
+
+const planes = [
+  { network: 'mainnet' as const, pool: sql, db, queue: queueFor(sql) },
+  ...(sqlTestnet
+    ? [{ network: 'testnet' as const, pool: sqlTestnet, db: sqlTestnet as unknown as Db, queue: queueFor(sqlTestnet) }]
+    : []),
+]
+const planeFor = (network: 'mainnet' | 'testnet') => {
+  const plane = planes.find((p) => p.network === network)
+  if (!plane) throw new Error(`no plane for network ${network}`)
+  return plane
+}
+
 // 7. Routes. After the Lifecycle so the health handlers report real state, and after the pool so the
 //    stores are real rather than a lazily-connected surprise on first request.
 const verifier = new Verifier({ jwksUrl: env.identityJwksUrl, issuer: env.identityIssuer })
@@ -148,9 +177,20 @@ const server = createServer({
   logger,
   metrics,
   verifier,
-  sql: db,
+  // The SELECTOR, not a handle — routes use `ctx.sql`, resolved once per request.
+  sql: networkSql({
+    mainnet: sql as unknown as RuntimeSql,
+    ...(sqlTestnet ? { testnet: sqlTestnet as unknown as RuntimeSql } : {}),
+  }),
+  ...(env.singleNetwork ? { singleNetwork: env.singleNetwork as 'mainnet' | 'testnet' } : {}),
   producer: SERVICE,
-  queue: { enqueue: (options) => queue.enqueue(options) },
+  // Boot-time value; `forRequest` replaces it with this request's network before any route sees
+  // it. An enqueue is a WRITE, and a fill job claimed by the other estate's runner clears against
+  // the other estate's book.
+  queue: { enqueue: (options) => planeFor('mainnet').queue.enqueue(options) },
+  queueFor: (network: 'mainnet' | 'testnet') => ({
+    enqueue: (options: Parameters<JobQueue['enqueue']>[0]) => planeFor(network).queue.enqueue(options),
+  }),
   ledger,
   pricing,
   clock: systemClock,
@@ -166,67 +206,80 @@ const server = createServer({
   // Queue depth is sampled at scrape time rather than on a timer. There is no `setInterval` in this
   // repository, and CI greps for one — rule 8.
   beforeScrape: async () => {
-    const stats = await queue.stats()
-    metrics.set('jobs_pending', stats.pending)
-    metrics.set('jobs_overdue', stats.overdue)
+    // Per network. Summed across both queues the gauge reads healthy while one estate's
+    // backlog grows for ever — micro-org#398 in another form.
+    for (const plane of planes) {
+      const stats = await plane.queue.stats()
+      metrics.set('jobs_pending', stats.pending, { network: plane.network })
+      metrics.set('jobs_overdue', stats.overdue, { network: plane.network })
+    }
   },
 })
 
 // 8. The job runner, started before `listen()`. Background work is claimed under a lease, so a
 //    replica that is draining stops claiming before it stops serving — `shouldClaim` is wired to the
 //    Lifecycle for exactly that.
-const queue = new JobQueue(sql as unknown as JobsSql, { owner: env.instanceId })
-const reschedule = rescheduleRecurring(queue, logger)
-const runner = new JobRunner({
-  queue,
-  concurrency: 4,
-  pollMs: 1_000,
-  shouldClaim: () => lifecycle.claimingJobs,
-  onEvent: (event) => {
-    if (event.kind) {
-      if (event.type === 'claimed') metrics.increment('jobs_claimed_total', { kind: event.kind })
-      if (event.type === 'completed') metrics.increment('jobs_completed_total', { kind: event.kind })
-      if (event.type === 'failed') metrics.increment('jobs_failed_total', { kind: event.kind })
-      if (event.type === 'dead') metrics.increment('jobs_dead_total', { kind: event.kind })
-      if (event.durationMs !== undefined) metrics.observe('jobs_duration_ms', event.durationMs, { kind: event.kind })
-    }
-    if (event.type === 'failed' || event.type === 'dead' || event.type === 'error') {
-      logger.error('job failure', { ...event })
-    }
-    reschedule(event)
-  },
-})
+// ── ONE RUNNER PER NETWORK ──────────────────────────────────────────────────────────────────
+//
+// Bulkheaded deliberately. A single runner over a single queue would drain mainnet and leave the
+// other estate's jobs to accumulate for ever, and every handler would hold the mainnet handle —
+// so the work would apply to the wrong rows and record success.
+const runners = planes.map((plane) => {
+  const reschedule = rescheduleRecurring(plane.queue, logger)
+  const runner = new JobRunner({
+      queue: plane.queue,
+    concurrency: 4,
+    pollMs: 1_000,
+    shouldClaim: () => lifecycle.claimingJobs,
+    onEvent: (event) => {
+      if (event.kind) {
+        const labels = { kind: event.kind, network: plane.network }
+        if (event.type === 'claimed') metrics.increment('jobs_claimed_total', labels)
+        if (event.type === 'completed') metrics.increment('jobs_completed_total', labels)
+        if (event.type === 'failed') metrics.increment('jobs_failed_total', labels)
+        if (event.type === 'dead') metrics.increment('jobs_dead_total', labels)
+        if (event.durationMs !== undefined) metrics.observe('jobs_duration_ms', event.durationMs, labels)
+      }
+      if (event.type === 'failed' || event.type === 'dead' || event.type === 'error') {
+        logger.error('job failure', { ...event })
+      }
+      reschedule(event)
+    },
+  })
 
-registerHandlers(runner, {
-  sql: db,
-  queue,
-  logger,
-  signingSecret: env.outboxSigningSecret,
-  producer: SERVICE,
-  idempotencyTtlDays: IDEMPOTENCY_TTL_DAYS,
-  tick: {
-    sql: db,
-    ledger,
-    pricing,
-    clock: systemClock,
-    logger: logger.child({ job: 'bot.tick' }),
+  registerHandlers(runner, {
+    sql: plane.db,
+    queue: plane.queue,
+    logger,
+    signingSecret: env.outboxSigningSecret,
     producer: SERVICE,
-    liveEnabled: env.liveEnabled,
-  },
-  fees: {
-    sql: db,
-    ledger,
-    clock: systemClock,
-    logger: logger.child({ job: 'bot.settle' }),
-    periodSeconds: env.settlementPeriodSeconds,
-  },
-  // Not gated on `env.exchangeEnabled`, deliberately — see the header of `src/jobs.ts`. The flag
-  // stops the exchange ACCEPTING work; maintenance of work it has already accepted must survive
-  // being switched off, or a withdrawal that debited a customer stays debited and unpaid.
-  exchange: { clock: systemClock, ledger },
+    idempotencyTtlDays: IDEMPOTENCY_TTL_DAYS,
+    tick: {
+      sql: plane.db,
+      ledger,
+      pricing,
+      clock: systemClock,
+      logger: logger.child({ job: 'bot.tick' }),
+      producer: SERVICE,
+      liveEnabled: env.liveEnabled,
+    },
+    fees: {
+      sql: plane.db,
+      ledger,
+      clock: systemClock,
+      logger: logger.child({ job: 'bot.settle' }),
+      periodSeconds: env.settlementPeriodSeconds,
+    },
+    // Not gated on `env.exchangeEnabled`, deliberately — see the header of `src/jobs.ts`. The flag
+    // stops the exchange ACCEPTING work; maintenance of work it has already accepted must survive
+    // being switched off, or a withdrawal that debited a customer stays debited and unpaid.
+    exchange: { clock: systemClock, ledger },
+  })
+  return runner
 })
-await seedRecurring(queue)
-runner.start()
+// Seeded into EVERY queue: an estate with no recurring sweep is half-running, not dormant.
+for (const plane of planes) await seedRecurring(plane.queue)
+for (const runner of runners) runner.start()
 
 // 9. Listen. Last of the construction steps, because a socket that accepts before its dependencies
 //    exist is a socket that answers 500.
@@ -244,12 +297,12 @@ lifecycle.markReady()
 //     first, then the runner stops claiming and drains, then the pool closes with nothing left to
 //     use it.
 lifecycle.onShutdown(async () => {
-  await sql.end({ timeout: 5 })
-  logger.info('database pool closed')
+  await Promise.all(planes.map((plane) => plane.pool.end({ timeout: 5 })))
+  logger.info('database pools closed', { networks: planes.length })
 })
 lifecycle.onShutdown(async () => {
-  const clean = await runner.stop(20_000)
-  logger.info('job runner stopped', { clean })
+  const clean = (await Promise.all(runners.map((r) => r.stop(20_000)))).every(Boolean)
+  logger.info('job runners stopped', { clean, runners: runners.length })
 })
 lifecycle.onShutdown(
   () =>
