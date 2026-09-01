@@ -2,6 +2,30 @@
 
 [![ci](https://github.com/cloudsforge-online/micro-trade/actions/workflows/ci.yml/badge.svg)](https://github.com/cloudsforge-online/micro-trade/actions/workflows/ci.yml) [![TypeScript](https://img.shields.io/badge/TypeScript-strict%20ESM-3178C6?logo=typescript&logoColor=white)](./tsconfig.base.json) [![node](https://img.shields.io/badge/node-%3E%3D22-5FA04E?logo=nodedotjs&logoColor=white)](./package.json) [![tests](https://img.shields.io/badge/tests-real%20Postgres-4169E1?logo=postgresql&logoColor=white)](./.github/workflows/ci.yml) [![licence](https://img.shields.io/badge/licence-MIT-blue)](./LICENSE)
 
+<!-- absorbed-banner -->
+> ## ⚠️ This code no longer deploys as a service. It runs inside `micro-agora`.
+>
+> Absorbed in wave **M5d**, release **2026.8.107** (2026-08-31) of the estate's service-merge sequence.
+>
+> **The canonical source is [`micro-agora`](https://github.com/cloudsforge-online/micro-agora)
+> at [`src/trade/`](https://github.com/cloudsforge-online/micro-agora/tree/main/src/trade).
+> Edit there.** What is in this repository is the copy the merge was made from: it is frozen, no
+> image is published from it, `cfctl bump` skips it, and nothing in the estate runs it.
+>
+> **Why the repository still exists.** Its registry row survives as `absorbed(…)`, which is what
+> keeps the Kubernetes `Service` of this name resolving — an `ExternalName` alias to `agora`, so
+> every caller that addresses it by service name still reaches the code. `deployableRepos()` keeps
+> the row and `releasableRepos()` drops it. The history here is also the history of the module.
+>
+> **What did not change**, and this is the point of the merge rather than an aside: the database is
+> still its own, the routes are unchanged except where a collision forced a remount, the migrations
+> still run under this module's name, and the trust boundary is unchanged. A merge moved a process
+> boundary, not a responsibility.
+>
+> Everything below describes the domain, and remains accurate. Read the reasoning — including what
+> was refused and why — in
+> [`micro-deploy/docs/service-merge-plan.md`](https://github.com/cloudsforge-online/micro-deploy/blob/main/docs/service-merge-plan.md).
+
 Strategy catalogue, backtests, bots, fills, allocations, fee settlements and performance reporting —
 and, behind `TRADE_EXCHANGE_ENABLED`, a **central limit order book**: price-time priority, escrowed
 orders, integer fees, self-trade prevention, an accurate ticker and a market-data surface.
